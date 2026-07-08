@@ -13,6 +13,16 @@
  * signature-incompatible symbol is left NULL instead of being called through a
  * mistyped pointer (kCFI panic). Per-symbol diagnostics go to stderr.
  *
+ * A second machine-readable line carries the running kernel's MIGRATE_CMA
+ * enumerator value (enum migratetype from BTF; -1 when absent, e.g. CONFIG_CMA=n):
+ *
+ *     migrate_cma=4
+ *
+ * which post-fs-data.sh feeds to `insmod ... migrate_cma_val=<N>`. The module
+ * cannot use its build-time MIGRATE_CMA: the enumerator's position shifts with
+ * the running kernel's config (CONFIG_MEMORY_ISOLATION etc.), and a wrong value
+ * would label pageblocks with someone else's migratetype.
+ *
  * Types are compared as DESUGARED canonical tokens (typedef/__bitwise
  * transparent), mirroring kCFI: gfp_t/acr_flags_t -> uint. A semantic value
  * change under an unchanged canonical type (6.18 migratetype->acr_flags) is
@@ -238,6 +248,35 @@ int main(int argc, char **argv)
 		cur = strlen(disable);
 		snprintf(disable + cur, sizeof disable - cur, "%s%s", ndis ? "," : "", sym);
 		ndis++;
+	}
+
+	/* MIGRATE_CMA's value on THIS kernel (enum migratetype). -1 = absent
+	 * (CONFIG_CMA=n or stripped BTF) -> the module keeps the CMA reservoir
+	 * feature off. Read from BTF, never from our build headers: the
+	 * enumerator's value is config/vendor-dependent. */
+	{
+		int cma_val = -1;
+		__s32 id = btf__find_by_name_kind(btf, "migratetype", BTF_KIND_ENUM);
+
+		if (id >= 0) {
+			const struct btf_type *t = btf__type_by_id(btf, id);
+			const struct btf_enum *e = (const struct btf_enum *)(t + 1);
+			int vlen = BTF_INFO_VLEN(t->info), i;
+
+			for (i = 0; i < vlen; i++) {
+				const char *n = btf__name_by_offset(btf, e[i].name_off);
+
+				if (n && !strcmp(n, "MIGRATE_CMA")) {
+					cma_val = e[i].val;
+					break;
+				}
+			}
+		}
+		if (cma_val < 0)
+			fprintf(stderr, "kapi_check: MIGRATE_CMA not in BTF (CONFIG_CMA=n?) -> reservoir off\n");
+		else
+			fprintf(stderr, "kapi_check: MIGRATE_CMA=%d\n", cma_val);
+		printf("migrate_cma=%d\n", cma_val);
 	}
 
 	printf("disable=%s\n", disable);

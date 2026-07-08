@@ -63,6 +63,7 @@
 #include <linux/string.h>
 #include <linux/swap.h>
 #include <linux/mm_inline.h>
+#include <linux/vmstat.h>
 /* Single source of truth for the resolvable kapi symbol names (KAPI_SYMBOLS),
  * generated from abi/kapi_abi.tsv by abi/gen_kapi.awk (also drives the userspace
  * ABI preflight). We only pull the name list here (not KAPI_ABI_WANT_TABLE). */
@@ -98,6 +99,17 @@
 #define ACQUIRE_FAIL_DECAY	3	/* a success drops the fail score by this */
 #define ACQUIRE_DELAY_MS	10	/* breathe between migrations */
 #define PAGE_ORDER		9	/* 2^9 * 4KB = 2MB */
+/* Highest order alloc_pages accepts on this kernel: MAX_ORDER was an EXCLUSIVE
+ * bound until 6.4 (23baf831a32c made it inclusive), and 6.8 renamed it
+ * MAX_PAGE_ORDER. Used by the CMA first-block verification span, which wants
+ * one allocation of pageblock_order + 1 when the kernel allows it. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define GH_MAX_ALLOC_ORDER	MAX_PAGE_ORDER
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#define GH_MAX_ALLOC_ORDER	MAX_ORDER
+#else
+#define GH_MAX_ALLOC_ORDER	(MAX_ORDER - 1)
+#endif
 #define REFILL_DELAY_MS_DEFAULT	5000
 #define REFILL_RETRY_MAX	3
 #define REFILL_RETRY_INTERVAL_MS 3000
@@ -128,6 +140,47 @@ module_param(refill_enable, int, 0600);
 MODULE_PARM_DESC(refill_enable,
 	"1=auto alloc-back refill after VM shutdown (default), 0=disable (test free-hook reclaim alone)");
 
+/* ---- CMA reservoir parameters (v10) ----
+ *
+ * The reservoir is the elastic half of the dual-pool model: pageblocks we
+ * labeled MIGRATE_CMA whose pages sit FREE in buddy. While a VM is down, app
+ * movable allocations use them like ordinary memory; unmovable allocations can
+ * never enter a CMA block, so when a VM is about to start, a targeted CMA-mode
+ * alloc_contig_range reassembles each block into 2MB pages in seconds instead
+ * of fighting the fragmentation wall (measured: 8GB in ~10s vs a sweep stalling
+ * at ~30%). pool_want_with_cma=0 (default) keeps all of this off: v9 behavior.
+ *
+ * Both preflight values below come from userspace (post-fs-data.sh) because the
+ * running kernel exposes neither: MIGRATE_CMA's value is config/vendor-dependent
+ * (read from /sys/kernel/btf/vmlinux by kapi_check), and pageblock_order is a
+ * pure macro - no kernel variable, absent from kallsyms and BTF (read from
+ * /proc/pagetypeinfo "Page block order"). Either missing -> feature off.
+ */
+
+static int migrate_cma_val = -1;
+module_param(migrate_cma_val, int, 0400);
+MODULE_PARM_DESC(migrate_cma_val,
+	"MIGRATE_CMA enumerator value on the running kernel (from kapi_check BTF preflight); -1 = CMA reservoir off");
+
+static int pageblock_order_val = -1;
+module_param(pageblock_order_val, int, 0400);
+MODULE_PARM_DESC(pageblock_order_val,
+	"pageblock_order of the running kernel (from /proc/pagetypeinfo preflight); -1 = CMA reservoir off");
+
+/*
+ * Headroom floor for FLIPPING blocks to CMA: every flip moves a pageblock from
+ * the everyone-budget to the movable-only budget, and the kernel's unmovable
+ * working set (~3.5G resident on these devices) cannot follow it there.
+ * Flip too far and unmovable allocations starve while "MemAvailable" still looks
+ * fine. So: refuse a flip once (si_mem_available - free CMA pages) would drop
+ * under this. This is a DIFFERENT brake from acquire_mem_floor_mb (which stops
+ * the sweep before reclaim livelocks); both apply, each guarding its own path.
+ */
+static unsigned int cma_reservoir_floor_mb = 1024;
+module_param(cma_reservoir_floor_mb, uint, 0600);
+MODULE_PARM_DESC(cma_reservoir_floor_mb,
+	"Refuse to flip more pageblocks to CMA when non-CMA available memory would drop below this many MB (default 1024)");
+
 /* ---- Pool ---- */
 
 static struct page *page_pool[POOL_SIZE_MAX];
@@ -142,6 +195,13 @@ static int pool_total;	/* current CAPACITY: pages we actually hold (avail +
 static int pool_want = 1024;	/* the single TARGET knob: set at insmod and at
 				 * runtime via the pool_want sysfs. init allocates
 				 * toward it; acquire raises capacity toward it. */
+static int pool_want_with_cma;	/* v10 TOTAL guardianship target in 2MB pages:
+				 * held pool (pool_want of it) + CMA reservoir
+				 * (the rest). 0 (default) = reservoir feature
+				 * off, exact v9 behavior. Invariant everywhere:
+				 * pool_want <= pool_want_with_cma <= pool_size_max
+				 * (0 is the disable sentinel, exempt). Set at
+				 * insmod and at runtime via its sysfs. */
 static int pool_size_max = POOL_SIZE_MAX;	/* effective cap on pool_want/capacity,
 						 * computed from system RAM at insmod
 						 * (see hugepage_reserve_init); every
@@ -151,6 +211,352 @@ MODULE_PARM_DESC(pool_size_max,
 	"Effective pool cap in 2MB pages: min(ram - min(ram/2, 6G), 24G); read-only");
 static bool pool_ready;		/* true once module_init has built the pool */
 static DEFINE_RAW_SPINLOCK(pool_lock);
+
+/* ---- CMA reservoir state (v10) ----
+ *
+ * cma_blocks[] is the ONE persistent piece of reservoir state: the base pfn of
+ * every pageblock that is currently ours-and-CMA. Everything else about the
+ * feature is either a parameter, derived on demand, or rebuildable - no origin
+ * tracking, no history masks. stage-in removes an entry, flip/build adds one,
+ * write-small demolition and exit restore-and-remove; that is the full
+ * lifecycle. Each entry is >= 2MB, so the count is bounded by POOL_SIZE_MAX.
+ *
+ * All mutation happens in process context under cma_mutex (build, demolition,
+ * verification, exit). Readers that only want the count (stats) read
+ * cma_blocks_n unlocked. The free hook NEVER touches this state: migratetype
+ * flips and frees of reservoir pages are process-context-only by design (S9
+ * invariant), so the hook's atomic context stays exactly as cheap as v9.
+ */
+static unsigned long cma_blocks[POOL_SIZE_MAX];
+static int cma_blocks_n;
+static u16 cma_est[POOL_SIZE_MAX];	/* per-block free-page estimates, parallel
+					 * to cma_blocks[]; scratch for demolition
+					 * and stage-in ordering (cma_mutex) */
+static DEFINE_MUTEX(cma_mutex);
+static int cma_pb_order = -1;	/* validated runtime pageblock order */
+static bool cma_capable;	/* settled ONCE at init: symbols + preflight
+				 * params all present AND the first-block
+				 * verification passed on live memory. A boot
+				 * constant - there is deliberately no lazy /
+				 * first-run runtime state (v10 rev.). */
+/* C4 tripwire: pages whose pageblock reads CMA that tried to enter the pool.
+ * Normally constant 0 - the process-context-only flip rule plus the free-hook
+ * gate guarantee no reservoir page ever reaches a pool entry point. Nonzero
+ * means a logic bug upstream; the page itself is refused (it drains to buddy
+ * and lands on the CMA freelist, which is its correct home either way). */
+static atomic_long_t dbg_cma_leak;
+
+/* Pages per pageblock / 2MB sub-blocks per pageblock, at the RUNTIME order.
+ * Only meaningful once cma_capable; order-9 devices give SUBBLKS = 1 and every
+ * pairing/exchange mechanism degenerates to a no-op. */
+#define CMA_PB_NR	(1UL << cma_pb_order)
+#define CMA_SUBBLKS	(1 << (cma_pb_order - PAGE_ORDER))
+
+/* Reservoir size in 2MB-page equivalents (the unit every other pool number
+ * uses), derived from the block count - never stored separately. Gated on the
+ * validated order, NOT on cma_capable: a systemic verification failure clears
+ * cma_capable but may leave committed blocks behind, and those must keep
+ * counting (for the GUI and for demolition targets) until demolished. */
+static int cma_pool_cma_2mb(void)
+{
+	if (READ_ONCE(cma_pb_order) < PAGE_ORDER)
+		return 0;
+	return READ_ONCE(cma_blocks_n) * CMA_SUBBLKS;
+}
+
+/* Round a 2MB-page target UP to whole pageblocks (§2: both wants are aligned
+ * while the feature is on; no-op on order-9 devices), stepping back DOWN if
+ * the round-up crossed the pool cap. */
+static int cma_align_2mb(int v)
+{
+	int sub;
+
+	if (!cma_capable)
+		return v;
+	sub = CMA_SUBBLKS;
+	if (sub <= 1)
+		return v;
+	v = roundup(v, sub);
+	if (v > pool_size_max)
+		v = rounddown(pool_size_max, sub);
+	return v;
+}
+
+/* pool_want raised past pool_want_with_cma: the total target follows (§5) -
+ * legacy management apps only write pool_want, and this keeps that one knob
+ * driving the whole elastic loop (grow -> with_cma follows -> acquire fills;
+ * shrink -> excess flips back to reservoir). Only while enabled: 0 is the
+ * disable sentinel and must never be pulled up. */
+static void cma_want_follow(int want)
+{
+	int wc = READ_ONCE(pool_want_with_cma);
+
+	if (wc > 0 && want > wc)
+		WRITE_ONCE(pool_want_with_cma, cma_align_2mb(want));
+}
+
+/* External-source gate - defined with the reservoir engine below; used by
+ * every external pool filler (refill worker, acquire loops). */
+static bool cma_external_ok(void);
+
+/* ================================================================== */
+/*  pb-hash: pageblock-completeness index (v10 §3, SUBBLKS > 1 only)  */
+/*                                                                    */
+/*  A DERIVED index over every 2MB sub-block the module guards,       */
+/*  grouped by pageblock: which siblings sit in the avail pool, which */
+/*  are lent out, which are parked in limbo. Everything it feeds      */
+/*  (pairing, exchange, shrink classes, cma_able stats) is an         */
+/*  OPTIMIZATION - the index can be rebuilt at any time from the pool */
+/*  array + served table + limbo pool, and losing an entry (overflow) */
+/*  degrades pairing quality, never correctness. Not populated at all */
+/*  on SUBBLKS == 1 devices, where every sub-block IS its pageblock.  */
+/* ================================================================== */
+
+#define PB_HASH_MAX	16384U		/* power of two; u16 chain indexes */
+#define PB_NULL		0xFFFFU
+
+#define PB_AVAIL	0x1		/* sub-block sits in the avail pool */
+#define PB_SERVED	0x2		/* sub-block lent to a VM */
+#define PB_LIMBO	0x4		/* sub-block parked in the limbo pool */
+
+struct pb_node {
+	unsigned long	pb;		/* key: pfn >> cma_pb_order */
+	u8		avail_mask;
+	u8		served_mask;
+	u8		limbo_mask;
+	u16		next;		/* freelist or bucket chain index */
+};
+
+static struct pb_node pb_nodes[PB_HASH_MAX];
+static u16 pb_bucket[PB_HASH_MAX];
+static u16 pb_free_head = PB_NULL;
+static int pb_count, pb_overflow;
+static int pb_full_avail;	/* entries whose avail_mask covers the whole
+				 * pageblock = groups flippable to CMA now
+				 * (pool_avail_cma_able, exchange capacity) */
+/* LEAF raw lock: mask updates happen from under pool_lock, served_lock and
+ * limbo_lock holders (both lock domains touch the same masks - §3), so this
+ * lock must never wrap any of them. It never does: every pb_* helper takes
+ * only pb_lock. */
+static DEFINE_RAW_SPINLOCK(pb_lock);
+
+static inline bool pb_enabled(void)
+{
+	return cma_capable && cma_pb_order > PAGE_ORDER;
+}
+
+static inline u8 pb_full_mask(void)
+{
+	return (u8)((1U << CMA_SUBBLKS) - 1);
+}
+
+static inline unsigned int pb_hash(unsigned long pb)
+{
+	return (unsigned int)pb & (PB_HASH_MAX - 1);
+}
+
+static inline u8 pb_bit_of(unsigned long pfn)
+{
+	return (u8)(1U << ((pfn >> PAGE_ORDER) & (CMA_SUBBLKS - 1)));
+}
+
+/* Inline byte popcount: hweight8 emits an out-of-line __sw_hweight8 libcall
+ * on these toolchains - a new undefined symbol the ABI check forbids. */
+static inline unsigned int pb_popcount8(u8 v)
+{
+	v = v - ((v >> 1) & 0x55);
+	v = (v & 0x33) + ((v >> 2) & 0x33);
+	return (v + (v >> 4)) & 0x0f;
+}
+
+/* pb_lock held. Returns node index or PB_NULL; *prevp (may be NULL) gets the
+ * chain predecessor for unlinking (collisions resolved by exact key compare,
+ * same scheme as the served table). */
+static u16 pb_find_locked(unsigned long pb, u16 *prevp)
+{
+	unsigned int b = pb_hash(pb);
+	u16 n, prev = PB_NULL;
+
+	for (n = pb_bucket[b]; n != PB_NULL; prev = n, n = pb_nodes[n].next)
+		if (pb_nodes[n].pb == pb)
+			break;
+	if (prevp)
+		*prevp = prev;
+	return n;
+}
+
+static void pb_reset_locked(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < PB_HASH_MAX; i++) {
+		pb_nodes[i].pb = 0;
+		pb_nodes[i].avail_mask = 0;
+		pb_nodes[i].served_mask = 0;
+		pb_nodes[i].limbo_mask = 0;
+		pb_nodes[i].next = (i + 1 < PB_HASH_MAX) ? (u16)(i + 1) : PB_NULL;
+		pb_bucket[i] = PB_NULL;
+	}
+	pb_free_head = 0;
+	pb_count = 0;
+	pb_full_avail = 0;
+}
+
+/*
+ * THE mask mutation entry point: move @pfn's sub-block bit between tracking
+ * sets (@set / @clear are PB_AVAIL/PB_SERVED/PB_LIMBO combos). All-bits-empty
+ * frees the node. Atomic-legal: raw leaf lock, static freelist, no
+ * allocation. Maintenance points (§3): serve (avail->served), hook reclaim
+ * (served->avail), hook escape (served->gone), reacquire (served->avail),
+ * reconcile purge (served->gone - the easy one to miss), pool entry (->avail),
+ * pool drain (avail->gone), limbo in/out.
+ */
+static void pb_track(unsigned long pfn, int set, int clear)
+{
+	unsigned long flags, pb;
+	u16 n, prev;
+	u8 bit, old_avail, full;
+
+	if (!pb_enabled())
+		return;
+	pb = pfn >> cma_pb_order;
+	bit = pb_bit_of(pfn);
+
+	raw_spin_lock_irqsave(&pb_lock, flags);
+	n = pb_find_locked(pb, &prev);
+	if (n == PB_NULL) {
+		unsigned int b;
+
+		if (!set)
+			goto out;	/* clearing an untracked block: no-op */
+		if (pb_free_head == PB_NULL) {
+			pb_overflow++;	/* index full: this sub-block's tracking
+					 * is lost until the next pb_rebuild */
+			goto out;
+		}
+		n = pb_free_head;
+		pb_free_head = pb_nodes[n].next;
+		b = pb_hash(pb);
+		pb_nodes[n].pb = pb;
+		pb_nodes[n].avail_mask = 0;
+		pb_nodes[n].served_mask = 0;
+		pb_nodes[n].limbo_mask = 0;
+		pb_nodes[n].next = pb_bucket[b];
+		pb_bucket[b] = n;
+		pb_count++;
+		prev = PB_NULL;		/* inserted at bucket head */
+	}
+	old_avail = pb_nodes[n].avail_mask;
+	if (set & PB_AVAIL)
+		pb_nodes[n].avail_mask |= bit;
+	if (set & PB_SERVED)
+		pb_nodes[n].served_mask |= bit;
+	if (set & PB_LIMBO)
+		pb_nodes[n].limbo_mask |= bit;
+	if (clear & PB_AVAIL)
+		pb_nodes[n].avail_mask &= ~bit;
+	if (clear & PB_SERVED)
+		pb_nodes[n].served_mask &= ~bit;
+	if (clear & PB_LIMBO)
+		pb_nodes[n].limbo_mask &= ~bit;
+
+	full = pb_full_mask();
+	if (old_avail == full && pb_nodes[n].avail_mask != full)
+		pb_full_avail--;
+	else if (old_avail != full && pb_nodes[n].avail_mask == full)
+		pb_full_avail++;
+
+	if (!(pb_nodes[n].avail_mask | pb_nodes[n].served_mask |
+	      pb_nodes[n].limbo_mask)) {
+		if (prev == PB_NULL)
+			pb_bucket[pb_hash(pb)] = pb_nodes[n].next;
+		else
+			pb_nodes[prev].next = pb_nodes[n].next;
+		pb_nodes[n].next = pb_free_head;
+		pb_free_head = n;
+		pb_count--;
+	}
+out:
+	raw_spin_unlock_irqrestore(&pb_lock, flags);
+}
+
+/* Snapshot @pfn's pageblock masks (zeros when untracked). Any context. */
+static void pb_peek(unsigned long pfn, u8 *avail, u8 *served, u8 *limbo)
+{
+	unsigned long flags;
+	u16 n;
+
+	*avail = *served = *limbo = 0;
+	if (!pb_enabled())
+		return;
+	raw_spin_lock_irqsave(&pb_lock, flags);
+	n = pb_find_locked(pfn >> cma_pb_order, NULL);
+	if (n != PB_NULL) {
+		*avail = pb_nodes[n].avail_mask;
+		*served = pb_nodes[n].served_mask;
+		*limbo = pb_nodes[n].limbo_mask;
+	}
+	raw_spin_unlock_irqrestore(&pb_lock, flags);
+}
+
+/* ---- Limbo pool (§3 待配池): held order-9 compounds that cannot be
+ * served (not counted avail) and are waiting for their siblings, capped
+ * small. Outcomes run at existing process-context trigger points (acquire,
+ * resize) - no new worker: block completed -> whole flip to CMA (deficit) or
+ * seats refilled; grown old -> genuinely freed. ---- */
+
+#define LIMBO_MAX	64
+static struct page *limbo_pages[LIMBO_MAX];
+static u8  limbo_age[LIMBO_MAX];	/* process passes survived */
+static int limbo_n;
+static DEFINE_RAW_SPINLOCK(limbo_lock);	/* leaf; may nest inside pool_lock */
+
+/* Any context. Caller does the pb_track(PB_LIMBO) bookkeeping. */
+static bool limbo_add(struct page *page)
+{
+	unsigned long flags;
+	bool ok = false;
+
+	raw_spin_lock_irqsave(&limbo_lock, flags);
+	if (limbo_n < LIMBO_MAX) {
+		limbo_pages[limbo_n] = page;
+		limbo_age[limbo_n] = 0;
+		limbo_n++;
+		ok = true;
+	}
+	raw_spin_unlock_irqrestore(&limbo_lock, flags);
+	return ok;
+}
+
+/* Remove and return the limbo entry at @idx (swap-with-last), NULL if gone.
+ * Caller does the pb_track(0, PB_LIMBO) bookkeeping. */
+static struct page *limbo_del_idx(int idx)
+{
+	unsigned long flags;
+	struct page *p = NULL;
+
+	raw_spin_lock_irqsave(&limbo_lock, flags);
+	if (idx >= 0 && idx < limbo_n) {
+		p = limbo_pages[idx];
+		limbo_pages[idx] = limbo_pages[limbo_n - 1];
+		limbo_age[idx] = limbo_age[limbo_n - 1];
+		limbo_n--;
+	}
+	raw_spin_unlock_irqrestore(&limbo_lock, flags);
+	return p;
+}
+
+/* Avail pool pages that could flip to CMA as WHOLE pageblocks right now.
+ * SUBBLKS == 1: every avail page is a whole, aligned pageblock, so this is
+ * simply pool_avail. SUBBLKS > 1: full-avail pb-hash entries x SUBBLKS. */
+static int cma_avail_cma_able_2mb(void)
+{
+	if (!cma_capable)
+		return 0;
+	if (CMA_SUBBLKS == 1)
+		return atomic_read(&pool_count);
+	return READ_ONCE(pb_full_avail) * CMA_SUBBLKS;
+}
 
 /* ---- Probe state ---- */
 
@@ -459,6 +865,11 @@ static bool served_del(unsigned long pfn)
 		}
 	}
 	raw_spin_unlock_irqrestore(&served_lock, flags);
+	/* Every served_del caller means "this sub-block stops being lent out"
+	 * (hook match, reacquire); whether it becomes avail again is the
+	 * caller's pool-entry step (which sets PB_AVAIL there). */
+	if (found)
+		pb_track(pfn, 0, PB_SERVED);
 	return found;
 }
 
@@ -549,6 +960,11 @@ static void served_do_reconcile(void)
 				served_bucket[b] = nx;
 			else
 				served_nodes[prev].next = nx;
+			/* purge = this sub-block stops being "served" without
+			 * ever re-entering the pool: the pb-hash must drop the
+			 * bit too or the block reads more complete than it is
+			 * (§3 - the maintenance point that is easy to miss). */
+			pb_track(served_nodes[n].pfn, 0, PB_SERVED);
 			served_nodes[n].next = served_free_head;
 			served_free_head = n;
 			served_count--;
@@ -656,6 +1072,21 @@ struct kapi {
 	/* --- per-block evict B: required for id=3 (madvise(MADV_PAGEOUT) path) --- */
 	bool (*k_folio_isolate_lru)(struct folio *folio);	/* true = isolated off-LRU */
 	unsigned long (*k_reclaim_pages)(struct list_head *list);
+	/* --- CMA reservoir (v10): required as a set, see kapi_can_cma() --- */
+	void (*k_set_pageblock_migratetype)(struct page *page, int migratetype);
+	/* Read a pageblock's migratetype label (mask 0x7). MUST be the kernel's
+	 * copy, never the module's inline get/set: those compute the bit index
+	 * from the BUILD kernel's pageblock_order, which lands on the wrong bits
+	 * whenever build != device order (the exact case pageblock_order_val
+	 * exists for). Resolved only on [6.1, 6.16). */
+	unsigned long (*k_get_pfnblock_flags_mask)(const struct page *page,
+			unsigned long pfn, unsigned long mask);
+	/* CMA-mode contig grab (isolates/undoes with the CMA migratetype, like
+	 * cma_alloc does). ONLY legal inside blocks whose label is already CMA -
+	 * ours via cma_blocks[] - because the isolation undo rewrites the label
+	 * with the mode's migratetype. */
+	int (*k_alloc_contig_range_cma)(unsigned long start, unsigned long end,
+			gfp_t gfp_mask);
 	/* --- optional enhancers: NULL just degrades the feature, never disables --- */
 	void (*k_lru_add_drain_all)(void);	/* accurate PageLRU for the gate */
 	void (*k_drop_slab)(void);		/* unpoison slab-held windows */
@@ -707,6 +1138,25 @@ static int kapi_alloc_contig_range_shim(unsigned long start, unsigned long end,
 	return kraw.k_alloc_contig_range(start, end, 0 /* ACR_FLAGS_NONE */, gfp_mask);
 #else
 	return kraw.k_alloc_contig_range(start, end, MIGRATE_MOVABLE, gfp_mask);
+#endif
+}
+
+/* CMA-mode grab: arg 3 is the runtime MIGRATE_CMA value on <= 6.12 (our
+ * build-time MIGRATE_CMA may not match the device kernel's - that is why the
+ * preflight supplies it), ACR_FLAGS_CMA on the >= 6.16 acr_flags_t contract.
+ * The >= 6.16 branch is dormant today (the whole feature compile-gates off
+ * there because the 6.16 migratetype rework changed pageblock-flag semantics
+ * and 6.18 made the setter static), but the shim stays correct if that gate
+ * is ever relaxed. */
+static int kapi_alloc_contig_range_cma_shim(unsigned long start, unsigned long end,
+					    gfp_t gfp_mask)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+	return kraw.k_alloc_contig_range(start, end, 1 /* ACR_FLAGS_CMA */, gfp_mask);
+#else
+	return kraw.k_alloc_contig_range(start, end,
+					 (unsigned int)READ_ONCE(migrate_cma_val),
+					 gfp_mask);
 #endif
 }
 
@@ -804,6 +1254,66 @@ static inline bool kapi_has_sys_reclaim(void)	/* A: optional enhancer for id=2 *
 {
 	return kapi.k_try_to_free_mem_cgroup_pages && kapi.k_mem_cgroup_from_task;
 }
+static inline bool kapi_can_cma(void)		/* v10 CMA reservoir */
+{
+	return kapi.k_set_pageblock_migratetype && kapi.k_get_pfnblock_flags_mask &&
+	       kapi.k_alloc_contig_range_cma && kapi.k_alloc_contig_pages &&
+	       kapi.k_prep_compound_page &&
+	       migrate_cma_val >= 0 &&
+	       pageblock_order_val >= PAGE_ORDER && pageblock_order_val <= 11;
+}
+
+/* ================================================================== */
+/*  CMA reservoir: label read + pool-entry tripwire                   */
+/* ================================================================== */
+
+/* Migratetype label of @pfn's pageblock through the KERNEL's reader (see the
+ * kapi field comment: the module's inline would mis-index when build != device
+ * pageblock_order). Pure bitmap read - safe from any context, no lock. */
+static inline int cma_pb_mt(unsigned long pfn)
+{
+	return (int)kapi.k_get_pfnblock_flags_mask(pfn_to_page(pfn), pfn, 0x7);
+}
+
+/* §9 flip whitelist: labels a fully-held block may carry into a flip.
+ * UNMOVABLE(0)/MOVABLE(1)/RECLAIMABLE(2) are the stable first three
+ * enumerators everywhere and are FUNGIBLE on a block whose every page we
+ * hold (steal residue means nothing without free pages to steal). Everything
+ * else - CMA (someone's carveout), HIGHATOMIC (reserve ledger), ISOLATE,
+ * >= 6 (vendor CHP, panic-guarded) - is rejected without needing its value. */
+static inline bool cma_mt_flippable(int mt)
+{
+	return mt == 0 || mt == 1 || mt == 2;
+}
+
+/*
+ * C4 tripwire, called at EVERY pool entry point (take_frozen / push /
+ * push_grow): a page whose pageblock is labeled CMA - ours or anyone's - must
+ * never be held by the pool. Ours, because a reservoir page entering the held
+ * pool without stage-in corrupts the guardianship accounting; anyone else's,
+ * because pooling a vendor-CMA page steals from a carveout that cma_alloc will
+ * later demand back. Returns true = refuse (caller lets the page continue to
+ * buddy, where it lands on the CMA freelist - the correct home either way).
+ * Normally never fires (v9 alloc paths are !movable so never draw from CMA
+ * freelists; the B-class shrink protection keeps reservoir blocks whole); the
+ * counter going nonzero is a logic-bug alarm, not an expected event - hence
+ * counter + rate-limited pr_err, no VM_WARN (production kernels run DEBUG_VM=n)
+ * and certainly no panic. Inert until the preflight supplied migrate_cma_val
+ * and the reader resolved, so v9-path devices pay one branch. */
+static bool cma_pool_entry_reject(struct page *page)
+{
+	unsigned long pfn;
+
+	if (READ_ONCE(migrate_cma_val) < 0 || !kapi.k_get_pfnblock_flags_mask)
+		return false;
+	pfn = page_to_pfn(page);
+	if (cma_pb_mt(pfn) != migrate_cma_val)
+		return false;
+	atomic_long_inc(&dbg_cma_leak);
+	pr_err_ratelimited("cma: CMA-labeled page pfn=%lx refused pool entry (cma_leak tripwire)\n",
+			   pfn);
+	return true;
+}
 
 /* ================================================================== */
 /*  Pool push/pop (protected by pool_lock)                            */
@@ -855,6 +1365,8 @@ static struct page *pool_serve(pid_t tgid)
 	if (page)
 		served_add_locked(page_to_pfn(page), tgid);
 	raw_spin_unlock_irqrestore(&served_lock, flags);
+	if (page)
+		pb_track(page_to_pfn(page), PB_SERVED, PB_AVAIL);
 	return page;
 }
 
@@ -864,6 +1376,8 @@ static bool pool_push(struct page *page)
 	int idx;
 	bool ok;
 
+	if (cma_pool_entry_reject(page))	/* C4 tripwire */
+		return false;
 	raw_spin_lock_irqsave(&pool_lock, flags);
 	idx = atomic_read(&pool_count);
 	ok = (idx < pool_total);
@@ -872,6 +1386,8 @@ static bool pool_push(struct page *page)
 		atomic_set(&pool_count, idx + 1);
 	}
 	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	if (ok)
+		pb_track(page_to_pfn(page), PB_AVAIL, 0);
 	return ok;
 }
 
@@ -886,6 +1402,8 @@ static bool pool_push_grow(struct page *page)
 	int idx;
 	bool ok;
 
+	if (cma_pool_entry_reject(page))	/* C4 tripwire */
+		return false;
 	raw_spin_lock_irqsave(&pool_lock, flags);
 	idx = atomic_read(&pool_count);
 	ok = (idx < READ_ONCE(pool_size_max));
@@ -896,6 +1414,8 @@ static bool pool_push_grow(struct page *page)
 			WRITE_ONCE(pool_total, idx + 1);
 	}
 	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	if (ok)
+		pb_track(page_to_pfn(page), PB_AVAIL, 0);
 	return ok;
 }
 
@@ -962,6 +1482,8 @@ static bool pool_take_frozen(struct page *page)
 	int idx;
 	bool ok;
 
+	if (cma_pool_entry_reject(page))	/* C4 tripwire (atomic-safe: bitmap read) */
+		return false;
 	raw_spin_lock_irqsave(&pool_lock, flags);
 	idx = atomic_read(&pool_count);
 	ok = (idx < READ_ONCE(pool_want));
@@ -974,7 +1496,98 @@ static bool pool_take_frozen(struct page *page)
 			WRITE_ONCE(pool_total, idx + 1);
 	}
 	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	if (ok)
+		pb_track(page_to_pfn(page), PB_AVAIL, 0);
 	return ok;
+}
+
+/*
+ * §8 exchange path (SUBBLKS > 1 only, and only when the pool_want gate just
+ * refused a returning page - the "want was shrunk mid-flight" corner): losing
+ * this page to buddy would orphan its guarded siblings into a never-complete
+ * block, so instead ACCEPT it and demote one low-completeness avail page to
+ * the limbo pool - pool size unchanged, completeness strictly improved. If
+ * nothing is demotable, the new block itself parks in limbo. Everything here
+ * is list/bit work under raw locks (pool_lock -> pb_lock/limbo_lock, both
+ * leaf): no free, no flip, atomic-legal (§8). A page is only MUTATED
+ * (rebuild_order9_compound) after its destination is secured - a refused page
+ * must continue into buddy pristine.
+ */
+static bool pool_take_frozen_exchange(struct page *page)
+{
+	unsigned long flags, pfn = page_to_pfn(page), vpfn = 0;
+	unsigned int vcomp = ~0U;
+	int i, scan, vslot = -1, idx;
+	u8 av, sv, lb;
+	bool ok = false, to_limbo = false;
+
+	if (!pb_enabled() || !kapi.k_prep_compound_page)
+		return false;
+	pb_peek(pfn, &av, &sv, &lb);
+	if (!((av | sv | lb) & (u8)~pb_bit_of(pfn)))
+		return false;		/* no guarded sibling: drain as today */
+	if (cma_pool_entry_reject(page))
+		return false;		/* C4 applies here too */
+
+	raw_spin_lock_irqsave(&pool_lock, flags);
+	idx = atomic_read(&pool_count);
+	if (idx < READ_ONCE(pool_want)) {
+		/* raced: a seat opened between the gate and here - plain take */
+		rebuild_order9_compound(page);
+		page->mapping = NULL;
+		page_pool[idx] = page;
+		atomic_set(&pool_count, idx + 1);
+		if (idx + 1 > pool_total)
+			WRITE_ONCE(pool_total, idx + 1);
+		ok = true;
+		goto unlock;
+	}
+	/* bounded victim hunt from the stack top: lowest guardianship
+	 * completeness wins; complete blocks are never victims */
+	scan = min(idx, 32);
+	for (i = 0; i < scan; i++) {
+		struct page *cand = page_pool[idx - 1 - i];
+		unsigned int comp;
+		u8 cav, csv, clb;
+
+		if (!cand)
+			continue;
+		pb_peek(page_to_pfn(cand), &cav, &csv, &clb);
+		comp = pb_popcount8(cav | csv | clb);
+		if (comp >= (unsigned int)CMA_SUBBLKS)
+			continue;
+		if (comp < vcomp) {
+			vcomp = comp;
+			vslot = idx - 1 - i;
+		}
+	}
+	if (vslot >= 0) {
+		struct page *victim = page_pool[vslot];
+
+		if (limbo_add(victim)) {	/* destination secured first */
+			rebuild_order9_compound(page);
+			page->mapping = NULL;
+			page_pool[vslot] = page;
+			vpfn = page_to_pfn(victim);
+			ok = true;
+		}
+		/* limbo full: fall through, drain as today */
+	} else if (limbo_add(page)) {
+		/* nothing demotable: the new block itself waits in limbo */
+		rebuild_order9_compound(page);
+		page->mapping = NULL;
+		to_limbo = true;
+	}
+unlock:
+	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	if (ok) {
+		pb_track(pfn, PB_AVAIL, 0);
+		if (vpfn)
+			pb_track(vpfn, PB_LIMBO, PB_AVAIL);
+	} else if (to_limbo) {
+		pb_track(pfn, PB_LIMBO, 0);
+	}
+	return ok || to_limbo;
 }
 
 /* Cap on re-acquire attempts per scavenge pass: bounds the worker's runtime;
@@ -1099,6 +1712,12 @@ static void gh_free_one_page_cb(void *data, struct page *page, struct zone *zone
 	if (kapi.k_prep_compound_page && pool_take_frozen(page)) {
 		*bypass = true;
 		atomic_inc(&total_refilled);
+	} else if (pool_take_frozen_exchange(page)) {
+		/* §8: gate-refused, but siblings are guarded - the page was
+		 * exchanged into the pool (or parked in limbo) instead of
+		 * orphaning its block. */
+		*bypass = true;
+		atomic_inc(&total_refilled);
 	} else {
 		atomic_long_inc(&dbg_take_fail);
 		pr_warn_ratelimited("reclaim take FAILED pfn=%lx avail=%d want=%d total=%d\n",
@@ -1109,11 +1728,12 @@ static void gh_free_one_page_cb(void *data, struct page *page, struct zone *zone
 
 static int reclaim_debug_get(char *buf, const struct kernel_param *kp)
 {
-	return sysfs_emit(buf, "o9_seen=%ld\ndel_hit=%ld\ndel_miss=%ld\ntake_fail=%ld\n",
+	return sysfs_emit(buf, "o9_seen=%ld\ndel_hit=%ld\ndel_miss=%ld\ntake_fail=%ld\ncma_leak=%ld\n",
 			  atomic_long_read(&dbg_o9_seen),
 			  atomic_long_read(&dbg_del_hit),
 			  atomic_long_read(&dbg_del_miss),
-			  atomic_long_read(&dbg_take_fail));
+			  atomic_long_read(&dbg_take_fail),
+			  atomic_long_read(&dbg_cma_leak));
 }
 
 static const struct kernel_param_ops reclaim_debug_ops = {
@@ -1311,7 +1931,7 @@ static int vm_destroy_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	 * reclaim alone); we still sweep dead owners so tracking stays accurate.
 	 */
 	if (READ_ONCE(refill_enable) &&
-	    atomic_read(&pool_count) < pool_total &&
+	    atomic_read(&pool_count) + READ_ONCE(served_count) < pool_total &&
 	    atomic_cmpxchg(&refill_status, REFILL_IDLE, REFILL_WAITING) == REFILL_IDLE) {
 		schedule_delayed_work(&refill_work, 0);
 		pr_info("refill scheduled\n");
@@ -1417,7 +2037,8 @@ static void refill_worker(struct work_struct *work)
 			bool exited = false;
 			int i, count;
 
-			if (atomic_read(&pool_count) >= pool_total)
+			if (atomic_read(&pool_count) + READ_ONCE(served_count) >=
+			    pool_total)
 				break;
 
 			count = smp_load_acquire(&vm_owner_count.counter);
@@ -1442,7 +2063,7 @@ static void refill_worker(struct work_struct *work)
 	}
 
 	/* Phase 2: Brief pause for free-intercept to catch initial burst */
-	if (atomic_read(&pool_count) < pool_total)
+	if (atomic_read(&pool_count) + READ_ONCE(served_count) < pool_total)
 		msleep(200);
 
 	for (retry = 0; retry <= REFILL_RETRY_MAX; retry++) {
@@ -1453,19 +2074,31 @@ static void refill_worker(struct work_struct *work)
 		}
 
 		current_count = atomic_read(&pool_count);
-		target = pool_total - current_count;
+		/*
+		 * v10 §9 seat fix: lent-out pages OWN their seats. The v9
+		 * target (pool_total - avail) ignored served, so this worker
+		 * allocated fresh buddy pages into seats whose real pages were
+		 * still coming home through the free hook - a replacement
+		 * engine that evicted every returning VM page to buddy. Only
+		 * the shortfall the hook could not recover (avail + served <
+		 * capacity) is refilled from outside; cma_external_ok also
+		 * caps it under the with_cma total like every external filler.
+		 */
+		target = pool_total - current_count - READ_ONCE(served_count);
 
 		if (target <= 0) {
-			pr_info("pool already full (%d/%d)\n",
-				current_count, pool_total);
+			pr_info("pool already full (%d+%d/%d)\n",
+				current_count, READ_ONCE(served_count), pool_total);
 			break;
 		}
 
-		pr_info("refill attempt %d: need %d pages (have %d/%d)\n",
-			retry + 1, target, current_count, pool_total);
+		pr_info("refill attempt %d: need %d pages (have %d+%d/%d)\n",
+			retry + 1, target, current_count,
+			READ_ONCE(served_count), pool_total);
 
 		allocated = 0;
-		while (atomic_read(&pool_count) < pool_total) {
+		while (atomic_read(&pool_count) + READ_ONCE(served_count) <
+		       pool_total && cma_external_ok()) {
 			struct page *p;
 
 			p = alloc_pages(GFP_KERNEL | __GFP_COMP |
@@ -1489,7 +2122,7 @@ static void refill_worker(struct work_struct *work)
 		pr_info("refill attempt %d: got %d pages (pool now %d/%d)\n",
 			retry + 1, allocated, atomic_read(&pool_count), pool_total);
 
-		if (atomic_read(&pool_count) >= pool_total)
+		if (atomic_read(&pool_count) + READ_ONCE(served_count) >= pool_total)
 			break;
 	}
 
@@ -1621,6 +2254,11 @@ static int refill_stat_get(char *buf, const struct kernel_param *kp)
 	n += sysfs_emit_at(buf, n, "acquire_stop_reason=%s\n", READ_ONCE(acquire_stop_reason));
 	n += sysfs_emit_at(buf, n, "refill_enable=%d\n", READ_ONCE(refill_enable));
 	n += sysfs_emit_at(buf, n, "free_reclaim=%d\n", free_intercept_active ? 1 : 0);
+	/* v10 CMA reservoir block ('='-split like everything above, GUI-safe). */
+	n += sysfs_emit_at(buf, n, "pool_want_with_cma=%d\n", READ_ONCE(pool_want_with_cma));
+	n += sysfs_emit_at(buf, n, "pool_cma=%d\n", cma_pool_cma_2mb());
+	n += sysfs_emit_at(buf, n, "pool_avail_cma_able=%d\n", cma_avail_cma_able_2mb());
+	n += sysfs_emit_at(buf, n, "cma_pb_order=%d\n", cma_capable ? cma_pb_order : -1);
 
 	return n;
 }
@@ -1717,7 +2355,7 @@ static int manual_refill_set(const char *val, const struct kernel_param *kp)
 		return -ENODEV;
 	}
 
-	if (atomic_read(&pool_count) >= pool_total) {
+	if (atomic_read(&pool_count) + READ_ONCE(served_count) >= pool_total) {
 		pr_info("pool already full\n");
 		return 0;
 	}
@@ -1738,6 +2376,17 @@ static const struct kernel_param_ops manual_refill_ops = {
 module_param_cb(manual_refill, &manual_refill_ops, NULL, 0200);
 MODULE_PARM_DESC(manual_refill, "Write 1 to trigger manual pool refill");
 
+/* Headroom floor for CMA flips - defined with the reservoir engine below,
+ * together with the §7 class-ordered shrink pieces. */
+static bool cma_floor_ok(int nblocks);
+static int pool_extract_block(unsigned long pb, struct page **subs, int max);
+static struct page *pool_extract_pfn(unsigned long pfn);
+static unsigned long pb_find_full_avail(void);
+static unsigned long pb_find_class_c_avail(void);
+static int cma_commit_compound_block(unsigned long base, struct page **subs);
+static void cma_limbo_process(void);
+static int cma_verify_first_span(void);
+
 /*
  * pool_do_resize: change the target (pool_want).
  *   shrink (new < reserve): free available pages immediately, best effort
@@ -1754,6 +2403,8 @@ static void pool_do_resize(int newt)
 {
 	struct page *batch[32];
 	int target_avail;
+	bool flip = false;
+	int flip_budget = 0, flipped = 0;
 
 	/*
 	 * Clamp to the RAM-derived cap. A target below the currently lent-out
@@ -1792,6 +2443,85 @@ static void pool_do_resize(int newt)
 		target_avail = 0;
 	WRITE_ONCE(pool_total, target_avail);
 
+	/*
+	 * v10 §7 class-A slice (SUBBLKS==1 devices): a drained avail page IS a
+	 * whole, aligned pageblock, so instead of losing it to buddy it can
+	 * flip straight into the CMA reservoir - this is the return leg the
+	 * one-way "-f fork" never had (shrink used to disown the memory; now
+	 * the guardianship just changes form, capped at pool_want_with_cma -
+	 * newt). Class B (served siblings) / class C (partial) and SUBBLKS>1
+	 * pairing need the pb-hash and arrive with commits 2/3; with
+	 * SUBBLKS==1 every avail page is class A. The flip happens while the
+	 * page is still OUR fully-held compound (label change is safe), then
+	 * the ordinary order-9 compound free carries it - via a short pcp
+	 * transit whose stored pcppage migratetype preserves CMA - onto its
+	 * block's CMA freelist.
+	 */
+	if (cma_capable &&
+	    READ_ONCE(pool_want_with_cma) > newt && CMA_SUBBLKS == 1) {
+		mutex_lock(&cma_mutex);
+		flip = true;
+		flip_budget = READ_ONCE(pool_want_with_cma) - newt -
+			      cma_pool_cma_2mb();
+	}
+
+	/*
+	 * v10 §7 class order (SUBBLKS > 1): drop class-C strays to buddy
+	 * first (their blocks can never complete from what we hold), flip
+	 * class-A groups whole into the reservoir second, and only then let
+	 * the generic drain below take what remains - by then that is class B
+	 * (avail members whose lent-out siblings may still return and turn
+	 * the block into class A), deliberately dropped last.
+	 */
+	if (cma_capable && CMA_SUBBLKS > 1) {
+		int budget;
+
+		mutex_lock(&cma_mutex);
+		while (atomic_read(&pool_count) > target_avail) {	/* pass C */
+			unsigned long vpfn = pb_find_class_c_avail();
+			struct page *p;
+
+			if (!vpfn)
+				break;
+			p = pool_extract_pfn(vpfn);
+			if (!p) {
+				pb_track(vpfn, 0, PB_AVAIL);	/* stale bit */
+				continue;
+			}
+			__free_pages(p, PAGE_ORDER);
+			cond_resched();
+		}
+		budget = READ_ONCE(pool_want_with_cma) - newt - cma_pool_cma_2mb();
+		while (atomic_read(&pool_count) > target_avail) {	/* pass A */
+			unsigned long key = pb_find_full_avail();
+			struct page *subs[8];
+			int got, j, ret;
+
+			if (!key)
+				break;
+			got = pool_extract_block(key, subs, CMA_SUBBLKS);
+			if (!got)
+				break;	/* index/pool disagree: generic drain mops up */
+			ret = -EAGAIN;
+			if (got == CMA_SUBBLKS && budget >= CMA_SUBBLKS &&
+			    READ_ONCE(pool_want_with_cma) > newt &&
+			    cma_floor_ok(1))
+				ret = cma_commit_compound_block(
+					key << cma_pb_order, subs);
+			if (ret == 0) {
+				budget -= CMA_SUBBLKS;
+				flipped += CMA_SUBBLKS;
+				continue;
+			}
+			if (ret == -EIO)
+				cma_capable = false;
+			for (j = 0; j < got; j++)	/* over budget/floor: buddy */
+				__free_pages(subs[j], PAGE_ORDER);
+			cond_resched();
+		}
+		mutex_unlock(&cma_mutex);
+	}
+
 	/* free outside the lock to avoid the page allocator under it. */
 	for (;;) {
 		unsigned long flags;
@@ -1807,15 +2537,57 @@ static void pool_do_resize(int newt)
 		}
 		raw_spin_unlock_irqrestore(&pool_lock, flags);
 
-		for (i = 0; i < n; i++)
-			__free_pages(batch[i], PAGE_ORDER);
+		for (i = 0; i < n; i++) {
+			struct page *pg = batch[i];
+
+			pb_track(page_to_pfn(pg), 0, PB_AVAIL);	/* leaving avail */
+			if (flip && flip_budget > 0) {
+				unsigned long pfn = page_to_pfn(pg);
+				int mt = cma_pb_mt(pfn);
+
+				/* §9 whitelist + headroom floor, like every flip */
+				if (cma_mt_flippable(mt) &&
+				    cma_blocks_n < POOL_SIZE_MAX &&
+				    cma_floor_ok(1)) {
+					kapi.k_set_pageblock_migratetype(pg,
+							migrate_cma_val);
+					if (cma_pb_mt(pfn) == migrate_cma_val) {
+						__free_pages(pg, PAGE_ORDER);
+						cma_blocks[cma_blocks_n++] = pfn;
+						flip_budget--;
+						flipped++;
+						continue;
+					}
+					/* readback failed: unflip, fall through */
+					kapi.k_set_pageblock_migratetype(pg,
+							MIGRATE_MOVABLE);
+				}
+			}
+			__free_pages(pg, PAGE_ORDER);
+		}
 		if (n == 0)
 			break;
+		cond_resched();
+	}
+
+	if (flip) {
+		/* Flush the pcp transit so CmaFree/pool_cma agree right away
+		 * (a following stage-in grab drains internally anyway; this is
+		 * for the accounting the GUI and the floor guard read). */
+		if (flipped && kapi.k_drain_all_pages)
+			kapi.k_drain_all_pages(NULL);
+		mutex_unlock(&cma_mutex);
 	}
 
 	WRITE_ONCE(pool_total, newt);
-	pr_info("pool shrink: want=%d avail=%d served=%d\n",
-		newt, atomic_read(&pool_count), served_count);
+	if (pb_enabled()) {	/* §3: resize is a limbo trigger point too */
+		mutex_lock(&cma_mutex);
+		cma_limbo_process();
+		mutex_unlock(&cma_mutex);
+	}
+	pr_info("pool shrink: want=%d avail=%d served=%d flipped_to_cma=%d pool_cma=%d\n",
+		newt, atomic_read(&pool_count), served_count, flipped,
+		cma_pool_cma_2mb());
 }
 
 /*
@@ -1833,6 +2605,9 @@ static int pool_want_set(const char *val, const struct kernel_param *kp)
 		v = 0;
 	if (v > pool_size_max)
 		v = pool_size_max;
+	if (READ_ONCE(pool_want_with_cma) > 0)
+		v = cma_align_2mb(v);	/* whole-pageblock accounting while the
+					 * reservoir is enabled (§2) */
 
 	if (!READ_ONCE(pool_ready)) {
 		WRITE_ONCE(pool_want, v);	/* boot: init will allocate toward it */
@@ -1847,6 +2622,7 @@ static int pool_want_set(const char *val, const struct kernel_param *kp)
 		return -EBUSY;
 	} else {
 		pool_do_resize(v);		/* runtime: live resize */
+		cma_want_follow(v);		/* grow past with_cma: total follows (§5) */
 	}
 	return 0;
 }
@@ -1863,6 +2639,1611 @@ static const struct kernel_param_ops pool_want_ops = {
 module_param_cb(pool_want, &pool_want_ops, NULL, 0600);
 MODULE_PARM_DESC(pool_want,
 	"Target pages (insmod + runtime): grow raises target, shrink frees now, 0 soft-disables");
+
+/* ================================================================== */
+/*  CMA reservoir engine (v10)                                        */
+/*                                                                    */
+/*  Blocks live in exactly one of two states: HELD (every page ours,  */
+/*  refcount-normalized to order-0 singles, label being inspected or  */
+/*  flipped) or COMMITTED (label CMA, every page free in buddy on the */
+/*  block's own CMA freelist, base pfn recorded in cma_blocks[]).     */
+/*  Migratetype flips happen ONLY on fully-held blocks and ONLY in    */
+/*  process context under cma_mutex - the free hook never flips and   */
+/*  never frees (§9), which is what keeps label and freelist          */
+/*  consistent at every instant.                                      */
+/* ================================================================== */
+
+/* Free CMA pages on the pgdat the pool lives on. zone_page_state reads the
+ * same folded (slightly lagging) counters /proc/meminfo's CmaFree uses, but
+ * through our cached zone pointer - global_zone_page_state would add a
+ * vm_zone_stat dependency the symbol-safety check forbids. Phones are
+ * single-node, so one pgdat is the whole story; a second node would only make
+ * the floor guard conservative in the wrong direction, and none of the target
+ * devices has one. */
+static unsigned long cma_free_pages(void)
+{
+	struct pglist_data *pgdat;
+	unsigned long sum = 0;
+	int i;
+
+	if (!acq_zone)
+		return 0;
+	pgdat = acq_zone->zone_pgdat;
+	for (i = 0; i < MAX_NR_ZONES; i++)
+		sum += zone_page_state(&pgdat->node_zones[i], NR_FREE_CMA_PAGES);
+	return sum;
+}
+
+/* Headroom floor (§9): OK to flip @nblocks more pageblocks to CMA? CMA-free
+ * memory only serves movable allocations, so what must stay above the floor is
+ * available-minus-CMA - the budget kernel/unmovable allocations can still
+ * reach. This is a different brake from acquire_mem_floor_mb (anti-livelock
+ * for the sweep); both exist, each on its own path. */
+static bool cma_floor_ok(int nblocks)
+{
+	unsigned long floor = (unsigned long)READ_ONCE(cma_reservoir_floor_mb)
+				<< (20 - PAGE_SHIFT);
+	unsigned long need = (unsigned long)nblocks << cma_pb_order;
+	long noncma = (long)si_mem_available() - (long)cma_free_pages();
+
+	return noncma > (long)(floor + need);
+}
+
+/* Guardianship total in 2MB pages: held pool (avail + lent out) + reservoir.
+ * The §9 total invariant compares this against pool_want_with_cma. */
+static int cma_guardianship_2mb(void)
+{
+	return atomic_read(&pool_count) + READ_ONCE(served_count) +
+	       cma_pool_cma_2mb();
+}
+
+/* External-source gate (§6/§9): with the reservoir enabled, EXTERNAL memory
+ * may only be grabbed while total guardianship is below pool_want_with_cma -
+ * past that, a pool shortfall must be staged in from the reservoir, or fresh
+ * grabs would push the total over the target. v9 semantics (feature off) are
+ * untouched: 0/unset always allows. */
+static bool cma_external_ok(void)
+{
+	int wc = READ_ONCE(pool_want_with_cma);
+
+	return wc <= 0 || cma_guardianship_2mb() < wc;
+}
+
+/* FREE non-CMA pages on the pgdat (NR_FREE_PAGES - NR_FREE_CMA_PAGES): what
+ * an unmovable allocation can take RIGHT NOW, without reclaim.
+ * si_mem_available is the wrong ruler for "can the pool prefill still
+ * allocate": it counts reclaimable pagecache that order-9 GFP_KERNEL often
+ * cannot actually compact out (measured: prefill got 0/256 while MemAvailable
+ * showed 3.4G non-CMA). */
+static unsigned long cma_free_noncma_pages(void)
+{
+	struct pglist_data *pgdat;
+	unsigned long freep = 0;
+	int i;
+
+	if (!acq_zone)
+		return 0;
+	pgdat = acq_zone->zone_pgdat;
+	for (i = 0; i < MAX_NR_ZONES; i++)
+		freep += zone_page_state(&pgdat->node_zones[i], NR_FREE_PAGES);
+	return freep - min(freep, cma_free_pages());
+}
+
+/*
+ * Normalize a raw pfn range WE fully own to independent refcount-1 order-0
+ * pages, whatever mix it arrived as (alloc_pages(order) = head 1 / tails 0;
+ * alloc_contig_range = singles already). The same refcount surgery
+ * rebuild_order9_compound already does, pointed the other way: singles are
+ * the working form for label flips and partial frees.
+ */
+static void cma_span_make_singles(unsigned long pfn, unsigned long nr)
+{
+	unsigned long i;
+
+	for (i = 0; i < nr; i++)
+		set_page_count(pfn_to_page(pfn + i), 1);
+}
+
+/*
+ * Free a singles-held range into the buddy freelists as order-8 chunks.
+ * Order 8 is deliberate: it is above PAGE_ALLOC_COSTLY_ORDER and is not the
+ * THP order, so free_unref_page never parks it in a pcp list - every chunk
+ * goes straight through __free_one_page onto the freelist of the block's
+ * CURRENT label. That immediacy is load-bearing three times over: the
+ * first-block +512 accounting check reads NR_FREE_CMA_PAGES right after the
+ * free; the floor guard and the GUI read CmaFree and must see reservoir
+ * builds/demolitions at once; and a demolition grab must find the pages IN
+ * buddy, not parked in pcp. Adjacent chunks coalesce back up on their own.
+ * pfn/nr are pageblock-derived so the 256-page alignment always holds. The
+ * free hook ignores these frees (order != 9).
+ */
+static void cma_span_free_to_buddy(unsigned long pfn, unsigned long nr)
+{
+	const unsigned long step = 1UL << 8;
+	unsigned long i, j;
+
+	for (i = 0; i < nr; i += step) {
+		struct page *head = pfn_to_page(pfn + i);
+
+		for (j = 1; j < step; j++)
+			set_page_count(head + j, 0);	/* order-8 free wants tails at 0 */
+		__free_pages(head, 8);
+		cond_resched();
+	}
+}
+
+/*
+ * Flip one FULLY-HELD, singles-normalized pageblock to CMA and free it into
+ * its own (now CMA) freelist, recording it in cma_blocks[]. Label whitelist
+ * first (§9): accept {UNMOVABLE(0), MOVABLE(1), RECLAIMABLE(2)} - a
+ * grab/steal often leaves an UNMOVABLE residue on a block that is entirely
+ * ours, and holding every page makes the flip safe regardless of label.
+ * Reject everything else without needing its runtime value: CMA (someone
+ * else's carveout), HIGHATOMIC (the nr_reserved_highatomic ledger would go
+ * stale), ISOLATE (an isolation in flight), >= 6 (vendor CHP extensions,
+ * guarded by CHP_BUG_ON panics). 0/1/2 as raw integers is safe: they are the
+ * first three enumerators on every supported kernel. No steal can relabel the
+ * block between check and flip - steals happen when free pages of the block
+ * are allocated, and it has none while held. cma_mutex held.
+ * Returns 0 = committed; -EPERM = label not flippable (caller swaps
+ * candidates, block left untouched and still held); -EIO = readback after the
+ * flip failed = systemic, caller must stop the feature (block unflipped,
+ * still held).
+ */
+static int cma_block_commit(unsigned long base)
+{
+	int mt = cma_pb_mt(base);
+
+	if (!cma_mt_flippable(mt))
+		return -EPERM;
+	if (cma_blocks_n >= POOL_SIZE_MAX)
+		return -EPERM;			/* can't record: don't flip */
+	kapi.k_set_pageblock_migratetype(pfn_to_page(base), migrate_cma_val);
+	if (cma_pb_mt(base) != migrate_cma_val) {
+		kapi.k_set_pageblock_migratetype(pfn_to_page(base), MIGRATE_MOVABLE);
+		pr_err("cma: flip readback failed at pfn=%lx (wrote %d, read %d)\n",
+		       base, migrate_cma_val, cma_pb_mt(base));
+		return -EIO;
+	}
+	cma_span_free_to_buddy(base, CMA_PB_NR);
+	cma_blocks[cma_blocks_n++] = base;
+	return 0;
+}
+
+/*
+ * Take one reservoir block back out of circulation: CMA-mode contig grab
+ * (migrates app squatters out - they are movable by construction, nothing
+ * unmovable can have entered), flip back to MOVABLE while every page is held,
+ * free into the movable freelists. Returns 0 = restored (caller must drop the
+ * cma_blocks[] entry), -errno = grab failed this time (transient pin /
+ * memory pressure: entry stays, caller may retry later). cma_mutex held.
+ */
+static int cma_block_demolish(unsigned long base)
+{
+	int ret;
+
+	if (cma_pb_mt(base) != migrate_cma_val) {
+		/* Our label is gone - something relabeled a block we own the
+		 * bookkeeping for. Never grab through a foreign label (the
+		 * isolation undo would stamp OUR migratetype over theirs);
+		 * drop the entry and shout. Should never happen. */
+		pr_err("cma: reservoir block pfn=%lx lost its CMA label (mt=%d), dropping entry\n",
+		       base, cma_pb_mt(base));
+		return 0;
+	}
+	ret = kapi.k_alloc_contig_range_cma(base, base + CMA_PB_NR,
+					    GFP_KERNEL | __GFP_NOWARN);
+	if (ret)
+		return ret;
+	kapi.k_set_pageblock_migratetype(pfn_to_page(base), MIGRATE_MOVABLE);
+	cma_span_free_to_buddy(base, CMA_PB_NR);
+	return 0;
+}
+
+/* Racy free-page estimate for one block (no locks: page_count==0 covers buddy,
+ * pcp and in-flight frees well enough to RANK blocks by grab cost - the only
+ * consumer). */
+static u16 cma_block_free_estimate(unsigned long base)
+{
+	unsigned long pfn, end = base + CMA_PB_NR;
+	unsigned int freeish = 0;
+
+	for (pfn = base; pfn < end; pfn++)
+		if (page_count(pfn_to_page(pfn)) == 0)
+			freeish++;
+	return (u16)freeish;
+}
+
+#define CMA_EST_SKIP	0xFFFFU		/* demolition failed this pass: don't re-pick */
+
+/*
+ * Demolish reservoir blocks until guardianship fits under @target_2mb, or the
+ * whole reservoir when @all. Emptiest-first (§5): the fewer squatters a block
+ * has, the cheaper the grab-back - estimated once up front, then a linear
+ * arg-max per round (worst case ~12k^2 int compares, fine for a rare admin
+ * write). A block whose grab fails is skipped for the rest of THIS call;
+ * the caller decides whether to run another pass. Returns blocks restored.
+ * cma_mutex held, process context.
+ */
+static int cma_reservoir_demolish(int target_2mb, bool all)
+{
+	int i, done = 0;
+
+	for (i = 0; i < cma_blocks_n; i++) {
+		cma_est[i] = all ? 0 : cma_block_free_estimate(cma_blocks[i]);
+		cond_resched();
+	}
+
+	while (cma_blocks_n > 0) {
+		int pick = -1;
+		u16 best = 0;
+
+		if (!all && cma_guardianship_2mb() <= target_2mb)
+			break;
+		for (i = 0; i < cma_blocks_n; i++) {
+			if (cma_est[i] == CMA_EST_SKIP)
+				continue;
+			if (pick < 0 || cma_est[i] > best) {
+				pick = i;
+				best = cma_est[i];
+			}
+		}
+		if (pick < 0)
+			break;			/* every remaining block resisted */
+		if (cma_block_demolish(cma_blocks[pick]) == 0) {
+			/* swap-with-last in BOTH arrays */
+			cma_blocks[pick] = cma_blocks[cma_blocks_n - 1];
+			cma_est[pick] = cma_est[cma_blocks_n - 1];
+			WRITE_ONCE(cma_blocks_n, cma_blocks_n - 1);
+			done++;
+		} else {
+			cma_est[pick] = CMA_EST_SKIP;
+		}
+		cond_resched();
+	}
+	return done;
+}
+
+/*
+ * §6 stage-in (the commit-2 slice that works without the pb-hash): move
+ * reservoir blocks into the held pool while the pool reserve (avail + served)
+ * is short of pool_want. Whole-pageblock unit: CMA-mode grab (migrates app
+ * squatters out - movable by construction), flip MOVABLE, rebuild as SUBBLKS
+ * order-9 pool compounds, push into the pool, drop the cma_blocks[] entry.
+ * Guardianship is conserved 1:1, so the caller's "guardianship >=
+ * pool_want_with_cma" source-order check holds across the whole run.
+ * Emptiest-first: fewer squatters = cheaper grab = pool fills fastest.
+ * Interruptible via acquire_running like every acquire loop. A block whose
+ * grab fails is skipped for this call. cma_mutex held, process context.
+ * Returns blocks staged in.
+ */
+static int cma_stage_in(void)
+{
+	int i, staged = 0;
+
+	for (i = 0; i < cma_blocks_n; i++) {
+		cma_est[i] = cma_block_free_estimate(cma_blocks[i]);
+		cond_resched();
+	}
+
+	while (atomic_read(&acquire_running) && cma_blocks_n > 0 &&
+	       atomic_read(&pool_count) + READ_ONCE(served_count) <
+			READ_ONCE(pool_want)) {
+		int pick = -1;
+		u16 best = 0;
+		unsigned long base;
+
+		if (atomic_read(&pool_count) + CMA_SUBBLKS > READ_ONCE(pool_size_max))
+			break;			/* pool array capacity */
+		for (i = 0; i < cma_blocks_n; i++) {
+			if (cma_est[i] == CMA_EST_SKIP)
+				continue;
+			if (pick < 0 || cma_est[i] > best) {
+				pick = i;
+				best = cma_est[i];
+			}
+		}
+		if (pick < 0)
+			break;			/* every remaining block resisted */
+		base = cma_blocks[pick];
+		if (cma_pb_mt(base) != migrate_cma_val) {
+			pr_err("cma: reservoir block pfn=%lx lost its CMA label (mt=%d), dropping entry\n",
+			       base, cma_pb_mt(base));
+			goto drop;		/* never grab through a foreign label */
+		}
+		if (kapi.k_alloc_contig_range_cma(base, base + CMA_PB_NR,
+						  GFP_KERNEL | __GFP_NOWARN)) {
+			cma_est[pick] = CMA_EST_SKIP;
+			continue;
+		}
+		kapi.k_set_pageblock_migratetype(pfn_to_page(base), MIGRATE_MOVABLE);
+		for (i = 0; i < CMA_SUBBLKS; i++) {
+			struct page *head =
+				pfn_to_page(base + ((unsigned long)i << PAGE_ORDER));
+
+			rebuild_order9_compound(head);
+			if (pool_push_grow(head))
+				atomic_inc(&total_refilled);
+			else	/* capacity race: let it go whole */
+				__free_pages(head, PAGE_ORDER);
+		}
+		staged++;
+drop:
+		cma_blocks[pick] = cma_blocks[cma_blocks_n - 1];
+		cma_est[pick] = cma_est[cma_blocks_n - 1];
+		WRITE_ONCE(cma_blocks_n, cma_blocks_n - 1);
+		cond_resched();
+	}
+	if (staged)
+		pr_info("cma: staged %d block(s) into pool, avail=%d pool_cma=%d\n",
+			staged, atomic_read(&pool_count), cma_pool_cma_2mb());
+	return staged;
+}
+
+/* Reservoir deficit (§6): the feature is live and total guardianship has not
+ * reached the total target - Phase R's run condition. */
+static bool cma_reservoir_deficit(void)
+{
+	return cma_capable && READ_ONCE(pool_want_with_cma) > 0 &&
+	       cma_guardianship_2mb() < READ_ONCE(pool_want_with_cma);
+}
+
+
+/*
+ * Rebuild the pb-hash from scratch out of the pool array, the served table
+ * and the limbo pool (§3: derived index, not history - THIS is the proof).
+ * Run at acquire start: cheap insurance against overflow drift. Concurrent
+ * serves/reclaims during the rebuild leave a bit or two stale; the next
+ * rebuild corrects them, and nothing downstream treats the index as truth.
+ * Process context; chunked so no raw lock is held long.
+ */
+static void pb_rebuild(void)
+{
+	unsigned long flags, pfns[64];
+	int i, n, start;
+
+	if (!pb_enabled())
+		return;
+	raw_spin_lock_irqsave(&pb_lock, flags);
+	pb_reset_locked();
+	pb_overflow = 0;
+	raw_spin_unlock_irqrestore(&pb_lock, flags);
+
+	start = 0;
+	for (;;) {			/* avail pool, 64 slots per lock hold */
+		raw_spin_lock_irqsave(&pool_lock, flags);
+		n = 0;
+		for (i = start; i < atomic_read(&pool_count) && n < 64; i++)
+			if (page_pool[i])
+				pfns[n++] = page_to_pfn(page_pool[i]);
+		start = i;
+		raw_spin_unlock_irqrestore(&pool_lock, flags);
+		for (i = 0; i < n; i++)
+			pb_track(pfns[i], PB_AVAIL, 0);
+		if (n < 64)
+			break;
+		cond_resched();
+	}
+
+	for (start = 0; start < (int)SERVED_MAX; start++) {	/* served table */
+		u16 nd;
+
+		raw_spin_lock_irqsave(&served_lock, flags);
+		n = 0;
+		for (nd = served_bucket[start]; nd != SERVED_NULL && n < 64;
+		     nd = served_nodes[nd].next)
+			pfns[n++] = served_nodes[nd].pfn;
+		raw_spin_unlock_irqrestore(&served_lock, flags);
+		for (i = 0; i < n; i++)
+			pb_track(pfns[i], PB_SERVED, 0);
+		if ((start & 1023) == 0)
+			cond_resched();
+	}
+
+	raw_spin_lock_irqsave(&limbo_lock, flags);		/* limbo pool */
+	n = 0;
+	for (i = 0; i < limbo_n && n < 64; i++)
+		pfns[n++] = page_to_pfn(limbo_pages[i]);
+	raw_spin_unlock_irqrestore(&limbo_lock, flags);
+	for (i = 0; i < n; i++)
+		pb_track(pfns[i], PB_LIMBO, 0);
+}
+
+/*
+ * Remove every avail member of pageblock @pb from the pool array into @subs.
+ * One pool_lock hold over the whole array (~100us worst case at 12k entries):
+ * acceptable for the rare process-context callers (exchange, shrink groups),
+ * and a chunked removal scan would race the stack's own push/pop reindexing.
+ */
+static int pool_extract_block(unsigned long pb, struct page **subs, int max)
+{
+	unsigned long flags;
+	int i = 0, got = 0;
+
+	raw_spin_lock_irqsave(&pool_lock, flags);
+	while (i < atomic_read(&pool_count)) {
+		struct page *p = page_pool[i];
+
+		if (p && got < max &&
+		    (page_to_pfn(p) >> cma_pb_order) == pb) {
+			int last = atomic_read(&pool_count) - 1;
+
+			subs[got++] = p;
+			page_pool[i] = page_pool[last];
+			page_pool[last] = NULL;
+			atomic_set(&pool_count, last);
+			continue;	/* re-examine the swapped-in slot */
+		}
+		i++;
+	}
+	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	for (i = 0; i < got; i++)
+		pb_track(page_to_pfn(subs[i]), 0, PB_AVAIL);
+	return got;
+}
+
+/* Remove ONE specific avail page from the pool (Phase Q seat swap). */
+static struct page *pool_extract_pfn(unsigned long pfn)
+{
+	unsigned long flags;
+	struct page *p = NULL;
+	int i;
+
+	raw_spin_lock_irqsave(&pool_lock, flags);
+	for (i = 0; i < atomic_read(&pool_count); i++) {
+		if (page_pool[i] && page_to_pfn(page_pool[i]) == pfn) {
+			int last = atomic_read(&pool_count) - 1;
+
+			p = page_pool[i];
+			page_pool[i] = page_pool[last];
+			page_pool[last] = NULL;
+			atomic_set(&pool_count, last);
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	if (p)
+		pb_track(pfn, 0, PB_AVAIL);
+	return p;
+}
+
+/*
+ * Flip one whole pageblock whose SUBBLKS sub-blocks are all HELD as order-9
+ * compounds (extracted from the pool, or pool + limbo) into the reservoir.
+ * Same whitelist/readback contract as cma_block_commit; the compounds are
+ * freed AFTER the flip through the ordinary order-9 path (the stored pcppage
+ * migratetype carries CMA through the pcp transit). Floor is the caller's.
+ * cma_mutex held. 0 committed; -EPERM label; -EIO systemic (block NOT freed
+ * in either failure - pages stay with the caller).
+ */
+static int cma_commit_compound_block(unsigned long base, struct page **subs)
+{
+	int mt = cma_pb_mt(base), i;
+
+	if (!cma_mt_flippable(mt))
+		return -EPERM;
+	if (cma_blocks_n >= POOL_SIZE_MAX)
+		return -EPERM;
+	kapi.k_set_pageblock_migratetype(pfn_to_page(base), migrate_cma_val);
+	if (cma_pb_mt(base) != migrate_cma_val) {
+		kapi.k_set_pageblock_migratetype(pfn_to_page(base), MIGRATE_MOVABLE);
+		pr_err("cma: group flip readback failed at pfn=%lx\n", base);
+		return -EIO;
+	}
+	for (i = 0; i < CMA_SUBBLKS; i++)
+		__free_pages(subs[i], PAGE_ORDER);
+	cma_blocks[cma_blocks_n++] = base;
+	return 0;
+}
+
+/* Limbo intake cap (§6): compute BEFORE accepting - strays are only worth
+ * holding while the pool has cma_able groups to exchange them against. */
+static int cma_limbo_intake_cap(void)
+{
+	int cap = READ_ONCE(pb_full_avail) * CMA_SUBBLKS;
+
+	return min(cap, LIMBO_MAX);
+}
+
+/* An avail member of a class-C pageblock (§7: guardianship incomplete - some
+ * sibling is neither pooled, lent, nor in limbo). These are the first to go
+ * on a shrink: they can never complete into a flippable block by themselves.
+ * Returns the member's pfn, or 0. */
+static unsigned long pb_find_class_c_avail(void)
+{
+	unsigned long flags, pfn = 0;
+	unsigned int i;
+	u8 full = pb_full_mask();
+
+	for (i = 0; i < PB_HASH_MAX && !pfn; i++) {
+		u8 av, guard;
+
+		if ((i & 0x3ff) == 0)
+			cond_resched();
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		av = pb_nodes[i].avail_mask;
+		guard = av | pb_nodes[i].served_mask | pb_nodes[i].limbo_mask;
+		if (av && guard != full)
+			pfn = (pb_nodes[i].pb << cma_pb_order) +
+			      ((unsigned long)__ffs(av) << PAGE_ORDER);
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+	}
+	return pfn;
+}
+
+/* Scan for a full-avail pageblock (exchange material). Returns the pb key,
+ * or 0 (no pageblock 0 on these devices - DRAM starts well above it). */
+static unsigned long pb_find_full_avail(void)
+{
+	unsigned long flags, key = 0;
+	unsigned int i;
+	u8 full = pb_full_mask();
+
+	for (i = 0; i < PB_HASH_MAX && !key; i++) {
+		if ((i & 0x3ff) == 0)
+			cond_resched();
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		if (pb_nodes[i].avail_mask == full)
+			key = pb_nodes[i].pb;
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+	}
+	return key;
+}
+
+/*
+ * §6 Phase R exchange: pull one full-avail group out of the pool, flip it to
+ * CMA, and refill the vacated seats with limbo strays 1:1 - net effect: the
+ * reservoir gains a whole block, the pool trades clean group members for
+ * strays without changing size, and limbo drains. Loops while there is
+ * deficit, material and floor headroom. cma_mutex held.
+ */
+static void cma_limbo_exchange(void)
+{
+	int guard = LIMBO_MAX + 8;
+
+	if (!pb_enabled())
+		return;
+	while (guard-- > 0 && cma_reservoir_deficit() &&
+	       READ_ONCE(limbo_n) > 0 && READ_ONCE(pb_full_avail) > 0 &&
+	       cma_floor_ok(1)) {
+		struct page *subs[8];
+		unsigned long key = pb_find_full_avail();
+		int got, i, ret;
+
+		if (!key)
+			break;
+		got = pool_extract_block(key, subs, CMA_SUBBLKS);
+		if (got < CMA_SUBBLKS) {
+			/* stale entry (raced a serve): give the pages back */
+			for (i = 0; i < got; i++)
+				if (!pool_push(subs[i]))
+					__free_pages(subs[i], PAGE_ORDER);
+			continue;
+		}
+		ret = cma_commit_compound_block(key << cma_pb_order, subs);
+		if (ret) {
+			for (i = 0; i < got; i++)
+				if (!pool_push(subs[i]))
+					__free_pages(subs[i], PAGE_ORDER);
+			if (ret == -EIO) {
+				cma_capable = false;
+				break;
+			}
+			continue;	/* -EPERM: label not ours to flip */
+		}
+		for (i = 0; i < CMA_SUBBLKS; i++) {	/* refill seats 1:1 */
+			struct page *lp = limbo_del_idx(0);
+
+			if (!lp)
+				break;
+			pb_track(page_to_pfn(lp), 0, PB_LIMBO);
+			if (!pool_push(lp))
+				__free_pages(lp, PAGE_ORDER);
+		}
+		cond_resched();
+	}
+}
+
+/* Bump the age of limbo entry @idx; returns the new age or -1 if gone. */
+static int limbo_age_bump(int idx)
+{
+	unsigned long flags;
+	int age = -1;
+
+	raw_spin_lock_irqsave(&limbo_lock, flags);
+	if (idx >= 0 && idx < limbo_n)
+		age = ++limbo_age[idx];
+	raw_spin_unlock_irqrestore(&limbo_lock, flags);
+	return age;
+}
+
+#define LIMBO_MAX_AGE	3	/* process passes before a stray is given up on */
+
+/*
+ * §3 limbo outcomes, run at existing process-context trigger points (acquire
+ * end, resize end) - no new worker. Per entry: whole block now assembled from
+ * avail+limbo members and a deficit exists -> flip it whole; the pool has an
+ * open seat -> promote; grown old without its siblings -> genuinely free (a
+ * stray we cannot serve and cannot complete is dead weight). cma_mutex held.
+ */
+static void cma_limbo_process(void)
+{
+	int i = 0;
+
+	if (!pb_enabled())
+		return;
+	while (i < READ_ONCE(limbo_n)) {
+		unsigned long flags, pfn;
+		struct page *p;
+		u8 av, sv, lb;
+
+		raw_spin_lock_irqsave(&limbo_lock, flags);
+		if (i >= limbo_n) {
+			raw_spin_unlock_irqrestore(&limbo_lock, flags);
+			break;
+		}
+		p = limbo_pages[i];
+		raw_spin_unlock_irqrestore(&limbo_lock, flags);
+		pfn = page_to_pfn(p);
+
+		/* Complete block sitting in avail+limbo, and a deficit: flip it
+		 * whole - the "組齊 -> 整塊翻 CMA" outcome. */
+		pb_peek(pfn, &av, &sv, &lb);
+		if (cma_reservoir_deficit() && cma_floor_ok(1) && !sv && lb &&
+		    (u8)(av | lb) == pb_full_mask()) {
+			unsigned long key = pfn >> cma_pb_order;
+			struct page *subs[8];
+			int got, j, ret;
+
+			got = pool_extract_block(key, subs, CMA_SUBBLKS);
+			/* pull the block's limbo members (including @p) */
+			for (j = 0; j < READ_ONCE(limbo_n) && got < CMA_SUBBLKS;) {
+				struct page *lp;
+
+				raw_spin_lock_irqsave(&limbo_lock, flags);
+				lp = (j < limbo_n) ? limbo_pages[j] : NULL;
+				raw_spin_unlock_irqrestore(&limbo_lock, flags);
+				if (!lp)
+					break;
+				if ((page_to_pfn(lp) >> cma_pb_order) == key) {
+					lp = limbo_del_idx(j);
+					if (lp) {
+						pb_track(page_to_pfn(lp), 0, PB_LIMBO);
+						subs[got++] = lp;
+					}
+					continue;	/* j now holds swapped entry */
+				}
+				j++;
+			}
+			ret = (got == CMA_SUBBLKS) ?
+				cma_commit_compound_block(key << cma_pb_order, subs) :
+				-EAGAIN;
+			if (ret) {
+				/* give members back: pool if seated, else free */
+				for (j = 0; j < got; j++)
+					if (!pool_push(subs[j]))
+						__free_pages(subs[j], PAGE_ORDER);
+				if (ret == -EIO) {
+					cma_capable = false;
+					return;
+				}
+			}
+			continue;	/* entry i changed either way: re-examine */
+		}
+
+		/* Open pool seat: promote the stray into it. */
+		if (atomic_read(&pool_count) + READ_ONCE(served_count) <
+		    READ_ONCE(pool_want)) {
+			p = limbo_del_idx(i);
+			if (!p)
+				continue;
+			pb_track(page_to_pfn(p), 0, PB_LIMBO);
+			if (!pool_push_grow(p))
+				__free_pages(p, PAGE_ORDER);
+			continue;	/* slot i holds the swapped-in entry */
+		}
+
+		/* Aged out: its siblings never showed - stop hoarding. */
+		if (limbo_age_bump(i) > LIMBO_MAX_AGE) {
+			p = limbo_del_idx(i);
+			if (!p)
+				continue;
+			pb_track(page_to_pfn(p), 0, PB_LIMBO);
+			__free_pages(p, PAGE_ORDER);
+			continue;
+		}
+		i++;
+	}
+}
+
+/*
+ * Grab the FREE missing sibling windows of @any_pfn's pageblock with targeted
+ * movable-mode contig ranges and push them into the pool. §6 pairing: called
+ * right after grab_free lands a block (its buddy neighbors are often still
+ * free - grab them before anyone else fragments the block) and from the
+ * pairing pass over half-full pb entries. Returns windows gained.
+ */
+static int cma_grab_missing_siblings(unsigned long any_pfn, int max_grabs)
+{
+	unsigned long base, w;
+	u8 av, sv, lb, missing, full;
+	int b, got = 0;
+
+	if (!pb_enabled() || !kapi.k_alloc_contig_range ||
+	    !kapi.k_prep_compound_page)
+		return 0;
+	full = pb_full_mask();
+	base = any_pfn & ~(CMA_PB_NR - 1);
+	pb_peek(any_pfn, &av, &sv, &lb);
+	missing = full & ~(av | sv | lb);
+	if (!missing)
+		return 0;
+	for (b = 0; b < CMA_SUBBLKS && got < max_grabs; b++) {
+		struct page *head;
+
+		if (!(missing & (1U << b)))
+			continue;
+		if (atomic_read(&pool_count) + READ_ONCE(served_count) >=
+		    READ_ONCE(pool_want) || !cma_external_ok())
+			break;
+		w = base + ((unsigned long)b << PAGE_ORDER);
+		if (!pfn_valid(w) || cma_pb_mt(w) == migrate_cma_val)
+			break;		/* never contig-grab through a CMA label */
+		if (kapi.k_alloc_contig_range(w, w + (1UL << PAGE_ORDER),
+					      GFP_KERNEL | __GFP_NOWARN |
+					      __GFP_NORETRY))
+			continue;
+		head = pfn_to_page(w);
+		rebuild_order9_compound(head);
+		if (!pool_push_grow(head)) {
+			__free_pages(head, PAGE_ORDER);
+			break;
+		}
+		atomic_inc(&total_refilled);
+		got++;
+	}
+	return got;
+}
+
+/*
+ * §6 pairing pass (Phase 1.5, SUBBLKS > 1): walk the pb-hash for blocks the
+ * pool already partly owns and fetch their free siblings with targeted grabs
+ * - far cheaper than sweeping for brand-new blocks, and every success turns a
+ * stray into (eventual) exchange material. Bounded per acquire run.
+ */
+static void cma_pair_fill(void)
+{
+	unsigned int i;
+	int budget = 256;
+
+	if (!pb_enabled())
+		return;
+	for (i = 0; i < PB_HASH_MAX && budget > 0; i++) {
+		unsigned long flags, pb;
+		u8 av, sv, lb, full = pb_full_mask();
+
+		if (!atomic_read(&acquire_running) || !cma_external_ok() ||
+		    atomic_read(&pool_count) + READ_ONCE(served_count) >=
+			READ_ONCE(pool_want))
+			break;
+		if ((i & 0xff) == 0)
+			cond_resched();
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		av = pb_nodes[i].avail_mask;
+		sv = pb_nodes[i].served_mask;
+		lb = pb_nodes[i].limbo_mask;
+		pb = pb_nodes[i].pb;
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+		if (!(av | sv | lb) || (u8)(av | sv | lb) == full)
+			continue;	/* free node or already complete */
+		budget -= CMA_SUBBLKS;
+		cma_grab_missing_siblings(pb << cma_pb_order, CMA_SUBBLKS);
+	}
+}
+
+/*
+ * Complete a just-swept window's pageblock by grabbing every OTHER window of
+ * the block (§6 Phase R "湊得齊" attempt). Only legal when no sibling is in
+ * guardianship (those cases go to limbo and complete via exchange). On
+ * success the WHOLE block is singles-held. On failure the partial grabs are
+ * freed and the original window is untouched. cma_mutex held.
+ */
+static int cma_try_complete_block(unsigned long win)
+{
+	unsigned long base = win & ~(CMA_PB_NR - 1), w;
+	unsigned long got_wins[8];
+	u8 av, sv, lb;
+	int b, got = 0, i;
+
+	pb_peek(win, &av, &sv, &lb);
+	if (av | sv | lb)
+		return -EBUSY;		/* siblings guarded: limbo/exchange path */
+	for (b = 0; b < CMA_SUBBLKS; b++) {
+		w = base + ((unsigned long)b << PAGE_ORDER);
+		if (w == win)
+			continue;
+		if (!pfn_valid(w) ||
+		    kapi.k_alloc_contig_range(w, w + (1UL << PAGE_ORDER),
+					      GFP_KERNEL | __GFP_NOWARN)) {
+			for (i = 0; i < got; i++)
+				cma_span_free_to_buddy(got_wins[i],
+						       1UL << PAGE_ORDER);
+			return -EAGAIN;
+		}
+		got_wins[got++] = w;
+	}
+	return 0;
+}
+
+/*
+ * §6 Phase R consumer: feed one swept-and-assembled 2MB window (singles-held)
+ * to the reservoir. Whole block assemblable -> flip it in directly, never
+ * transiting the pool. Not assemblable (guarded or straggler siblings) ->
+ * park in limbo up to the exchange capacity. Anything else -> free back.
+ * Returns 0 consumed, -ENOSPC floor (caller stops Phase R), -EIO systemic,
+ * -EAGAIN window freed back.
+ */
+static int cma_sweep_window_to_reservoir(unsigned long win)
+{
+	unsigned long base = win & ~(CMA_PB_NR - 1);
+	int ret;
+
+	mutex_lock(&cma_mutex);
+	if (!cma_floor_ok(1)) {
+		mutex_unlock(&cma_mutex);
+		cma_span_free_to_buddy(win, 1UL << PAGE_ORDER);
+		return -ENOSPC;
+	}
+	if (CMA_SUBBLKS == 1) {
+		ret = cma_block_commit(base);	/* window IS the block */
+		if (ret == -EIO)
+			cma_capable = false;
+		mutex_unlock(&cma_mutex);
+		if (ret)
+			cma_span_free_to_buddy(win, 1UL << PAGE_ORDER);
+		return ret ? (ret == -EIO ? -EIO : -EAGAIN) : 0;
+	}
+
+	ret = cma_try_complete_block(win);
+	if (ret == 0) {
+		ret = cma_block_commit(base);	/* all windows singles-held */
+		if (ret == -EIO)
+			cma_capable = false;
+		mutex_unlock(&cma_mutex);
+		if (ret)
+			cma_span_free_to_buddy(base, CMA_PB_NR);
+		return ret ? (ret == -EIO ? -EIO : -EAGAIN) : 0;
+	}
+	/* stray: park for the exchange if it is worth holding */
+	if (READ_ONCE(limbo_n) < cma_limbo_intake_cap()) {
+		struct page *head = pfn_to_page(win);
+
+		rebuild_order9_compound(head);
+		if (limbo_add(head)) {
+			pb_track(win, PB_LIMBO, 0);
+			mutex_unlock(&cma_mutex);
+			return 0;
+		}
+		/* raced full: back to singles and out */
+		cma_span_make_singles(win, 1UL << PAGE_ORDER);
+	}
+	mutex_unlock(&cma_mutex);
+	cma_span_free_to_buddy(win, 1UL << PAGE_ORDER);
+	return -EAGAIN;
+}
+
+/* Victim search for the Phase Q seat swap: the least-complete pageblock
+ * (fewest guarded sub-blocks) other than @exclude that still has an avail
+ * member. Returns one avail member's pfn, or 0. Complete blocks are never
+ * victims - they are the cma_able capital Phase Q exists to grow. */
+static unsigned long pb_find_worst_avail(unsigned long exclude)
+{
+	unsigned long flags, best_pfn = 0;
+	unsigned int i, best_pop = 0xff;
+
+	for (i = 0; i < PB_HASH_MAX; i++) {
+		unsigned long pb;
+		unsigned int pop;
+		u8 av, guard;
+
+		if ((i & 0x3ff) == 0)
+			cond_resched();
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		av = pb_nodes[i].avail_mask;
+		guard = av | pb_nodes[i].served_mask | pb_nodes[i].limbo_mask;
+		pb = pb_nodes[i].pb;
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+		if (!av || pb == exclude || guard == pb_full_mask())
+			continue;
+		pop = pb_popcount8(guard);
+		if (pop < best_pop) {
+			best_pop = pop;
+			best_pfn = (pb << cma_pb_order) +
+				   ((unsigned long)__ffs(av) << PAGE_ORDER);
+			if (pop == 1)
+				break;	/* cannot get worse */
+		}
+	}
+	return best_pfn;
+}
+
+/*
+ * §6 Phase Q (quality): counts are met but some avail sub-blocks sit in
+ * pageblocks the module will never own whole (foreign stragglers). Upgrade:
+ * targeted-grab the missing windows of partly-owned blocks; each success
+ * REALLY frees one least-complete stray (process context may genuinely free)
+ * and seats the new sibling instead - pool size unchanged, cma_able rising.
+ * Also sweeps the limbo pool. Returns true if anything improved; the caller
+ * stops on false ("quality converged"). SUBBLKS > 1 only.
+ */
+static bool cma_phase_q(void)
+{
+	unsigned int i;
+	int budget = 64;
+	bool progress = false;
+
+	if (!pb_enabled())
+		return false;
+	for (i = 0; i < PB_HASH_MAX && budget > 0; i++) {
+		unsigned long flags, pb, base, w;
+		u8 av, sv, lb, missing, full = pb_full_mask();
+		int b;
+
+		if (!atomic_read(&acquire_running))
+			break;
+		if ((i & 0xff) == 0)
+			cond_resched();
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		av = pb_nodes[i].avail_mask;
+		sv = pb_nodes[i].served_mask;
+		lb = pb_nodes[i].limbo_mask;
+		pb = pb_nodes[i].pb;
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+		if (!av || (u8)(av | sv | lb) == full)
+			continue;
+		missing = full & ~(av | sv | lb);
+		base = pb << cma_pb_order;
+		for (b = 0; b < CMA_SUBBLKS && budget > 0; b++) {
+			struct page *head, *victim;
+			unsigned long vpfn;
+
+			if (!(missing & (1U << b)))
+				continue;
+			w = base + ((unsigned long)b << PAGE_ORDER);
+			if (!pfn_valid(w) || cma_pb_mt(w) == migrate_cma_val)
+				break;
+			if (kapi.k_alloc_contig_range(w, w + (1UL << PAGE_ORDER),
+						      GFP_KERNEL | __GFP_NOWARN)) {
+				budget--;
+				continue;
+			}
+			head = pfn_to_page(w);
+			rebuild_order9_compound(head);
+			/* seat swap: really free one least-complete stray */
+			vpfn = pb_find_worst_avail(pb);
+			victim = vpfn ? pool_extract_pfn(vpfn) : NULL;
+			if (victim) {
+				__free_pages(victim, PAGE_ORDER);
+				if (!pool_push(head))
+					__free_pages(head, PAGE_ORDER);
+				progress = true;
+			} else if (!pool_push_grow(head)) {
+				__free_pages(head, PAGE_ORDER);
+				budget = 0;	/* no seats, no victims: done */
+			} else {
+				progress = true;
+			}
+			budget--;
+		}
+	}
+	mutex_lock(&cma_mutex);
+	cma_limbo_process();	/* 順手: promote/complete/evict strays */
+	mutex_unlock(&cma_mutex);
+	return progress;
+}
+
+/* Accept the first-block +512 accounting check when at least 3/4 of it shows:
+ * the per-cpu vmstat fold our order-8 frees force can carry up to ~125 pages
+ * of unrelated residue either way (stat threshold cap), while the failure
+ * being tested for - migrate_cma_val not actually meaning MIGRATE_CMA - shows
+ * a delta of ~0. 384 splits those cleanly. */
+#define CMA_VERIFY_DELTA_MIN	(3L << (PAGE_ORDER - 2))
+#define CMA_VERIFY_CAND_MAX	8
+
+/*
+ * First-block verification (§4): the ONE place the module proves, on live
+ * memory, that its three preflight-derived beliefs hold before it will label
+ * anything CMA: (a) pageblock_order_val is the kernel's real pageblock order,
+ * (b) migrate_cma_val is really MIGRATE_CMA (accounting moves with it),
+ * (c) CONTIG_RANGE_CMA can grab a block back. Runs UNCONDITIONALLY at every
+ * init (cma_boot_build) and nowhere else - its outcome folds into cma_capable
+ * as a boot constant, so there is no first-run runtime state to manage.
+ *
+ * The span is TWO pageblocks at DOUBLE alignment, fully held. That shape is
+ * what makes an off-by-one-level pageblock_order_val belief SAFE to probe: if
+ * the belief is one too small, the flip covers the whole held span and the
+ * base+PB_NR readback (expected MOVABLE, reads CMA) catches it; if one too
+ * big, the flip covers only the first real block and the base+PB_NR-1
+ * readback (expected CMA, reads MOVABLE) catches it. Either way nothing
+ * outside memory we hold was ever relabeled, and the flip-back restores it
+ * whole. One allocation of order pb+1 provides the span where the kernel
+ * allows it; otherwise (order-10 pageblocks on 6.1, whose max alloc order is
+ * 10) one pageblock is allocated and its 2x-alignment sibling is grabbed with
+ * a movable-mode contig range.
+ *
+ * Candidates may carry ANY whitelisted label ({0,1,2}, like every other
+ * flip): the boundary checks compare against RECORDED pre-values, not against
+ * a hardcoded MOVABLE, so steal residue does not defeat them. This matters in
+ * the field: after the module itself has churned GFP_KERNEL blocks through
+ * buddy for a while, movable high-order allocations come back with UNMOVABLE
+ * residue labels almost every time (measured: a runtime enable on the OnePlus
+ * exhausted eight strictly-MOVABLE candidates and silently fell back to v9).
+ * A candidate with a non-whitelisted label is HELD until the hunt ends:
+ * freeing it at once would just hand the same block back on the next try.
+ *
+ * On success the span becomes reservoir blocks #1 and #2 (zero waste). On a
+ * pre-write mismatch: nothing was written, swap candidates (bounded, then
+ * pr_warn + feature stays unverified). On any post-write failure: systemic -
+ * restore the recorded label if still clean, otherwise ABANDON the first
+ * block CMA-labeled (its label and freelist stay mutually consistent; the
+ * memory remains app-usable movable; it merely refuses unmovable allocations
+ * until reboot), pr_err, feature off.
+ *
+ * Returns 0 verified; -EAGAIN candidates exhausted; -EIO systemic failure.
+ * cma_mutex held.
+ */
+static int cma_verify_first_span(void)
+{
+	const gfp_t mov_gfp = GFP_HIGHUSER_MOVABLE | __GFP_NOWARN | __GFP_RETRY_MAYFAIL;
+	const unsigned long pb_nr = CMA_PB_NR, span_nr = 2 * CMA_PB_NR;
+	unsigned long rej_pfn[CMA_VERIFY_CAND_MAX];
+	unsigned long rej_nr[CMA_VERIFY_CAND_MAX];
+	unsigned long base = 0;
+	int nrej = 0, tries, ret = -EAGAIN;
+	int pre0, pre2;
+	struct zone *z;
+	long before, delta;
+
+	for (tries = 0; tries < CMA_VERIFY_CAND_MAX && nrej < CMA_VERIFY_CAND_MAX;
+	     tries++) {
+		struct page *p;
+		unsigned long pfn, cand;
+
+		if (cma_pb_order + 1 <= GH_MAX_ALLOC_ORDER) {
+			/* one naturally 2x-aligned allocation = the whole span */
+			p = alloc_pages(mov_gfp, cma_pb_order + 1);
+			if (!p)
+				break;
+			cand = page_to_pfn(p);
+			if (!cma_mt_flippable(cma_pb_mt(cand)) ||
+			    !cma_mt_flippable(cma_pb_mt(cand + pb_nr))) {
+				cma_span_make_singles(cand, span_nr);
+				rej_pfn[nrej] = cand;
+				rej_nr[nrej++] = span_nr;
+				continue;
+			}
+			cma_span_make_singles(cand, span_nr);
+			base = cand;
+			break;
+		}
+		/*
+		 * pb+1 exceeds the alloc limit (order-10 pageblocks, 6.1): hold
+		 * single pageblocks one by one and PAIR any two that are each
+		 * other's 2x-alignment buddy - the stash doubles as the pairing
+		 * pool, both halves are then already held and NO foreign memory
+		 * is ever contig-grabbed. Adjacent blocks freed together (a
+		 * prior rmmod, a balloon exit) sit near each other on the
+		 * freelists, so consecutive allocations pair quickly. Fall back
+		 * to contig-grabbing the not-yet-held sibling only when it
+		 * still sits free/movable outside (measured: on churned memory
+		 * that grab alone fails eight times out of eight - pairing is
+		 * what makes a runtime-insmod verification viable at pb=10).
+		 */
+		p = alloc_pages(mov_gfp, cma_pb_order);
+		if (!p)
+			break;
+		pfn = page_to_pfn(p);
+		cand = pfn & ~(span_nr - 1);	/* 2x-aligned span base */
+		{
+			unsigned long sib = (cand == pfn) ? pfn + pb_nr
+							  : cand;
+			int j, pair = -1;
+
+			for (j = 0; j < nrej; j++)
+				if (rej_nr[j] == pb_nr && rej_pfn[j] == sib) {
+					pair = j;
+					break;
+				}
+			if (pair >= 0 && cma_mt_flippable(cma_pb_mt(pfn)) &&
+			    cma_mt_flippable(cma_pb_mt(sib))) {
+				/* both halves held: consume the stash entry */
+				rej_pfn[pair] = rej_pfn[nrej - 1];
+				rej_nr[pair] = rej_nr[nrej - 1];
+				nrej--;
+				cma_span_make_singles(pfn, pb_nr);
+				base = cand;	/* stashed half is singles already */
+				break;
+			}
+			if (pfn_valid(sib) && pfn_valid(sib + pb_nr - 1) &&
+			    page_zone(pfn_to_page(sib)) == page_zone(p) &&
+			    cma_mt_flippable(cma_pb_mt(pfn)) &&
+			    cma_mt_flippable(cma_pb_mt(sib)) &&
+			    !kapi.k_alloc_contig_range(sib, sib + pb_nr,
+					GFP_KERNEL | __GFP_NOWARN)) {
+				cma_span_make_singles(cand, span_nr);
+				base = cand;
+				break;
+			}
+			cma_span_make_singles(pfn, pb_nr);
+			rej_pfn[nrej] = pfn;
+			rej_nr[nrej++] = pb_nr;
+		}
+	}
+	if (!base)
+		goto out;	/* -EAGAIN: no flippable span obtainable */
+
+	/* Pre-write reads (non-destructive): RECORD the boundary labels the
+	 * post-write checks compare against. pre0 is base's REAL block's label
+	 * (whatever the real pageblock order is) - the restore value. */
+	pre0 = cma_pb_mt(base);
+	pre2 = cma_pb_mt(base + pb_nr);
+	if (!cma_mt_flippable(pre0) ||
+	    !cma_mt_flippable(cma_pb_mt(base + pb_nr - 1)) ||
+	    !cma_mt_flippable(pre2)) {
+		cma_span_free_to_buddy(base, span_nr);
+		goto out;	/* raced relabel: treat as exhausted */
+	}
+
+	kapi.k_set_pageblock_migratetype(pfn_to_page(base), migrate_cma_val);
+
+	/* Post-write boundary reads: base+PB_NR-1 catches a too-BIG order
+	 * belief (the real flip fell short of our believed block), base+PB_NR
+	 * catches a too-SMALL one (the real flip overflowed into the second
+	 * half - its label must still read exactly what was recorded). */
+	if (cma_pb_mt(base + pb_nr - 1) != migrate_cma_val ||
+	    cma_pb_mt(base + pb_nr) != pre2) {
+		pr_err("cma: pageblock_order_val=%d verification FAILED (post-write mt %d/%d, expected %d/%d) - feature off\n",
+		       pageblock_order_val,
+		       cma_pb_mt(base + pb_nr - 1), cma_pb_mt(base + pb_nr),
+		       migrate_cma_val, pre2);
+		kapi.k_set_pageblock_migratetype(pfn_to_page(base), pre0);
+		cma_span_free_to_buddy(base, span_nr);
+		ret = -EIO;
+		goto out;
+	}
+
+	/* Semantic check: one 2MB freed into the flipped block must move the
+	 * zone's CMA-free accounting by (about) +512 - proving migrate_cma_val
+	 * IS the accounting migratetype, not merely a writable label. */
+	z = page_zone(pfn_to_page(base));
+	before = (long)zone_page_state(z, NR_FREE_CMA_PAGES);
+	cma_span_free_to_buddy(base, 1UL << PAGE_ORDER);
+	delta = (long)zone_page_state(z, NR_FREE_CMA_PAGES) - before;
+	if (delta < CMA_VERIFY_DELTA_MIN) {
+		pr_err("cma: migrate_cma_val=%d verification FAILED (CMA-free delta %ld after +512 free) - feature off\n",
+		       migrate_cma_val, delta);
+		goto abandon_first;
+	}
+
+	/* End-to-end CMA-mode grab of exactly what was freed. */
+	if (kapi.k_alloc_contig_range_cma(base, base + (1UL << PAGE_ORDER),
+					  GFP_KERNEL | __GFP_NOWARN)) {
+		pr_err("cma: CONTIG_RANGE_CMA grab-back verification FAILED - feature off\n");
+		goto abandon_first;
+	}
+
+	/* Verified. First half (fully held again) is reservoir block #1... */
+	cma_span_free_to_buddy(base, pb_nr);
+	cma_blocks[cma_blocks_n++] = base;
+	/* ...second half goes through the standard commit = block #2 (zero
+	 * waste). Its label was just screened flippable, so -EPERM is all but
+	 * impossible; -EIO here would mean the setter works at base but not at
+	 * base+pb_nr - treat as systemic and undo block #1 too. */
+	if (cma_block_commit(base + pb_nr) != 0) {
+		cma_span_free_to_buddy(base + pb_nr, pb_nr);
+		if (cma_block_demolish(base) == 0)
+			cma_blocks_n--;
+		ret = -EIO;
+		goto out;
+	}
+	ret = 0;
+	pr_info("cma: first-block verification passed (pb_order=%d migrate_cma=%d pfn=%lx)\n",
+		cma_pb_order, migrate_cma_val, base);
+	goto out;
+
+abandon_first:
+	/*
+	 * 2MB of the first block already sits on its labeled freelist, so an
+	 * unflip would break label/freelist consistency. Leave the label, free
+	 * the rest of the first block into it (consistent), free the still-
+	 * MOVABLE second half normally, and forget the block. Worst case one
+	 * stray CMA-labeled pageblock until reboot - inert and app-usable.
+	 */
+	pr_err("cma: abandoning one CMA-labeled pageblock at pfn=%lx\n", base);
+	cma_span_free_to_buddy(base + (1UL << PAGE_ORDER),
+			       pb_nr - (1UL << PAGE_ORDER));
+	cma_span_free_to_buddy(base + pb_nr, pb_nr);
+	ret = -EIO;
+out:
+	while (nrej-- > 0)
+		cma_span_free_to_buddy(rej_pfn[nrej], rej_nr[nrej]);
+	/* Candidates exhausted is a QUIET failure mode by design (nothing was
+	 * written), but the operator must be able to see why an enable flow
+	 * silently stayed on the v9 path - the exact trap a runtime enable on
+	 * a churned system fell into before this warning existed. */
+	if (ret == -EAGAIN)
+		pr_warn("cma: first-block verification found no usable candidate span (feature stays unverified)\n");
+	return ret;
+}
+
+#define CMA_BUILD_REJECTS	16
+
+/*
+ * Build the reservoir toward @target_blocks pageblocks (the first-block
+ * verification has already run at init - see cma_boot_build). Per block, the
+ * cheap path: allocate one whole pageblock, whitelist, flip, single readback,
+ * free in place.
+ *
+ * The per-block allocation is deliberately UNMOVABLE (GFP_KERNEL), not
+ * movable: a movable request is ALLOC_CMA-eligible, and once the growing
+ * reservoir dominates the zone's free memory the allocator starts handing the
+ * builder its own CMA blocks back (label 3 -> whitelist reject), starving the
+ * build - measured on the OnePlus 6.12: movable builds stalled at 1684/3840
+ * blocks with the reject stash full of our own pages. GFP_KERNEL can never be
+ * served from a CMA freelist, at the cost of an UNMOVABLE steal-residue label
+ * on the block - which is exactly what the {0,1,2} whitelist exists to accept
+ * (the flip is safe regardless of label because every page is held).
+ *
+ * Rejected candidates (foreign-CMA/highatomic/CHP labels) are held to the end
+ * - freeing one immediately would hand the same block right back. Every early
+ * stop is a pr_warn with the reason (§10). cma_mutex held, process context.
+ */
+static void cma_reservoir_build(int target_blocks, unsigned long reserve_pages)
+{
+	const gfp_t blk_gfp = GFP_KERNEL | __GFP_NOWARN | __GFP_RETRY_MAYFAIL;
+	struct page *rej[CMA_BUILD_REJECTS];
+	const char *stop = NULL;
+	int nrej = 0, i, ret;
+
+	while (cma_blocks_n < target_blocks) {
+		struct page *p;
+		unsigned long base;
+		int mt;
+
+		if (!cma_floor_ok(1)) {
+			stop = "headroom floor (cma_reservoir_floor_mb)";
+			break;
+		}
+		/* Leave @reserve_pages of FREE non-CMA memory for whoever runs
+		 * after the build (the boot prefill): the build itself consumes
+		 * exactly that pool, and si_mem_available can't see the
+		 * difference (measured: an unreserved build left the prefill
+		 * 0/256 with MemAvailable still reading gigabytes). */
+		if (reserve_pages &&
+		    cma_free_noncma_pages() < reserve_pages + 2 * CMA_PB_NR) {
+			stop = "leaving free memory for the pool prefill";
+			break;
+		}
+		p = alloc_pages(blk_gfp, cma_pb_order);
+		if (!p) {
+			stop = "pageblock allocation failed";
+			break;
+		}
+		base = page_to_pfn(p);
+		mt = cma_pb_mt(base);
+		if (!cma_mt_flippable(mt)) {	/* §9 whitelist */
+			rej[nrej++] = p;
+			if (nrej >= CMA_BUILD_REJECTS) {
+				stop = "too many unflippable candidates";
+				break;
+			}
+			continue;
+		}
+		cma_span_make_singles(base, CMA_PB_NR);
+		ret = cma_block_commit(base);
+		if (ret) {
+			/* label can't change while fully held, so this is the
+			 * -EIO readback path: systemic. Free the held block
+			 * (label restored/unchanged) and stop the feature. */
+			cma_span_free_to_buddy(base, CMA_PB_NR);
+			cma_capable = false;
+			stop = "flip readback failed";
+			break;
+		}
+		cond_resched();
+	}
+
+	for (i = 0; i < nrej; i++)
+		__free_pages(rej[i], cma_pb_order);
+	if (stop)
+		pr_warn("cma: reservoir build stopped: %s (%d/%d blocks)\n",
+			stop, cma_blocks_n, target_blocks);
+}
+
+/*
+ * Boot-time capability latch, want alignment and reservoir build - called
+ * from module_init AFTER kapi_init and BEFORE the pool prefill (§10):
+ * reservoir blocks are whole pageblocks and want the cleanest memory this
+ * boot will ever offer; the prefill's order-9 allocations then draw from what
+ * remains. GFP_KERNEL prefill can never draw from the blocks just committed
+ * (unmovable allocations cannot enter CMA freelists - the property the whole
+ * reservoir stands on).
+ *
+ * The first-block verification runs HERE, EVERY init, regardless of whether a
+ * reservoir was asked for - deliberately: capability becomes a boot constant
+ * settled while memory is at its cleanest, and no runtime enable flow ever
+ * needs a lazy first-run verification again (a runtime verify on churned
+ * memory was measured failing candidate hunts that boot-time trivially
+ * passes). The two blocks the protocol seeds cost ~one contig grab to trim
+ * back out when no reservoir is wanted.
+ */
+static void cma_boot_build(void)
+{
+	int target_blocks, ret;
+
+	cma_capable = kapi_can_cma();
+	if (pool_want_with_cma < 0)
+		pool_want_with_cma = 0;
+	if (!cma_capable) {
+		if (pool_want_with_cma)
+			pr_warn("cma: pool_want_with_cma=%d requested but unavailable (syms=%d migrate_cma_val=%d pageblock_order_val=%d) - v9 path\n",
+				pool_want_with_cma,
+				!!(kapi.k_set_pageblock_migratetype &&
+				   kapi.k_get_pfnblock_flags_mask &&
+				   kapi.k_alloc_contig_range_cma),
+				migrate_cma_val, pageblock_order_val);
+		pool_want_with_cma = 0;
+		return;
+	}
+	cma_pb_order = pageblock_order_val;
+	if (pb_enabled()) {			/* arm the completeness index */
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&pb_lock, flags);
+		pb_reset_locked();
+		raw_spin_unlock_irqrestore(&pb_lock, flags);
+	}
+
+	/* Clamp + align both targets (§2/§5): want <= with_cma <= size_max,
+	 * whole pageblocks each while enabled (0 stays the no-reservoir value). */
+	pool_want = cma_align_2mb(pool_want);
+	if (pool_want_with_cma > 0) {
+		if (pool_want_with_cma < pool_want)
+			pool_want_with_cma = pool_want;
+		if (pool_want_with_cma > pool_size_max)
+			pool_want_with_cma = pool_size_max;
+		pool_want_with_cma = cma_align_2mb(pool_want_with_cma);
+	}
+	target_blocks = pool_want_with_cma > 0 ?
+		(pool_want_with_cma - pool_want) / CMA_SUBBLKS : 0;
+
+	mutex_lock(&cma_mutex);
+	ret = cma_floor_ok(2) ? cma_verify_first_span() : -EAGAIN;
+	if (ret) {
+		cma_capable = false;		/* boot constant: no retry */
+		cma_pb_order = -1;
+		if (pool_want_with_cma)
+			pr_warn("cma: verification failed (%d), pool_want_with_cma=%d falls back to v9\n",
+				ret, pool_want_with_cma);
+		pool_want_with_cma = 0;
+		mutex_unlock(&cma_mutex);
+		return;
+	}
+	if (cma_blocks_n < target_blocks) {
+		/* Reserve the prefill's budget (pool_want order-9 pages) plus
+		 * a 64MB compaction slack in FREE non-CMA memory, so building
+		 * the reservoir first cannot starve the prefill that follows. */
+		cma_reservoir_build(target_blocks,
+				    ((unsigned long)pool_want << PAGE_ORDER) +
+				    (64UL << (20 - PAGE_SHIFT)));
+	}
+	/* Verification seeded two blocks: trim whatever exceeds the target
+	 * (all of it when no reservoir is wanted) - the fresh blocks are fully
+	 * free, so the grab-backs are instant. */
+	if (cma_blocks_n > target_blocks)
+		cma_reservoir_demolish(target_blocks * CMA_SUBBLKS, false);
+	mutex_unlock(&cma_mutex);
+
+	if (cma_blocks_n)
+		pr_info("cma: reservoir ready: %d pageblock(s) x %d MB = %d MB (target %d x 2MB)\n",
+			cma_blocks_n, 2 * CMA_SUBBLKS,
+			cma_pool_cma_2mb() * 2,
+			pool_want_with_cma - pool_want);
+}
+
+/*
+ * pool_want_with_cma (§5): the total guardianship target.
+ *   write big:   target only - construction is exclusively acquire's job.
+ *   write small: clamped to pool_want below; excess reservoir is demolished
+ *                NOW, emptiest blocks first.
+ *   write 0:     disable - demolish the whole reservoir; capability and
+ *                verification results survive, so re-enabling does not
+ *                re-test.
+ * Writing pool_want above with_cma pulls with_cma along (cma_want_follow);
+ * the reverse direction clamps here. Boot-time writes only record: init
+ * clamps, aligns and builds.
+ */
+static int pool_want_with_cma_set(const char *val, const struct kernel_param *kp)
+{
+	int v;
+
+	if (kstrtoint(val, 10, &v))
+		return -EINVAL;
+	if (v < 0)
+		v = 0;
+
+	if (!READ_ONCE(pool_ready)) {
+		WRITE_ONCE(pool_want_with_cma, v);
+		return 0;
+	}
+	if (v == 0) {
+		mutex_lock(&cma_mutex);
+		WRITE_ONCE(pool_want_with_cma, 0);
+		cma_reservoir_demolish(0, true);
+		if (cma_blocks_n)
+			pr_warn("cma: %d block(s) resisted demolition, still reservoir\n",
+				cma_blocks_n);
+		mutex_unlock(&cma_mutex);
+		return 0;
+	}
+	if (!cma_capable)
+		return -ENOSYS;
+
+	v = max(v, READ_ONCE(pool_want));
+	v = min(v, pool_size_max);
+	v = cma_align_2mb(v);
+	mutex_lock(&cma_mutex);
+	WRITE_ONCE(pool_want_with_cma, v);
+	cma_reservoir_demolish(v, false);	/* no-op unless shrinking */
+	mutex_unlock(&cma_mutex);
+	return 0;
+}
+
+static int pool_want_with_cma_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(pool_want_with_cma));
+}
+
+static const struct kernel_param_ops pool_want_with_cma_ops = {
+	.set = pool_want_with_cma_set,
+	.get = pool_want_with_cma_get,
+};
+module_param_cb(pool_want_with_cma, &pool_want_with_cma_ops, NULL, 0600);
+MODULE_PARM_DESC(pool_want_with_cma,
+	"Total guardianship target in 2MB pages (pool + CMA reservoir); 0 = reservoir off (v9 behavior)");
+
+static int pool_cma_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d\n", cma_pool_cma_2mb());
+}
+
+static const struct kernel_param_ops pool_cma_ops = {
+	.get = pool_cma_get,
+};
+module_param_cb(pool_cma, &pool_cma_ops, NULL, 0400);
+MODULE_PARM_DESC(pool_cma, "CMA reservoir size in 2MB-page equivalents (read-only)");
+
+static int pool_avail_cma_able_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d\n", cma_avail_cma_able_2mb());
+}
+
+static const struct kernel_param_ops pool_avail_cma_able_ops = {
+	.get = pool_avail_cma_able_get,
+};
+module_param_cb(pool_avail_cma_able, &pool_avail_cma_able_ops, NULL, 0400);
+MODULE_PARM_DESC(pool_avail_cma_able,
+	"Avail pool pages flippable to CMA as whole pageblocks (read-only)");
+
+/*
+ * §11 cma_usage: GUI occupancy view of the reservoir. The module is the ONLY
+ * party that can produce it - the reservoir is no registered struct cma (so
+ * debugfs cannot see it) and global CmaFree mixes in the vendor carveouts.
+ * Racy-by-design snapshot (pages move while we scan; GUI use tolerates it),
+ * buddy-order / folio_nr_pages jumps + cond_resched keep it cheap, and a ~1s
+ * cache keeps a polling GUI from rescanning gigabytes. used_anon_mb doubles
+ * as the acquire cost estimate: roughly how much must migrate out before a VM
+ * start.
+ */
+static unsigned long cma_usage_v[5];	/* pages: total/free/used/anon/file */
+static int cma_usage_b[3];		/* blocks: free/partial/full */
+static unsigned long cma_usage_jiffies;	/* 0 = no snapshot yet */
+
+static int cma_usage_get(char *buf, const struct kernel_param *kp)
+{
+	unsigned long free_p = 0, anon_p = 0, file_p = 0, total_p;
+	int bfree = 0, bpart = 0, bfull = 0, i, n;
+
+	mutex_lock(&cma_mutex);
+	if (cma_usage_jiffies &&
+	    time_before(jiffies, cma_usage_jiffies + HZ))
+		goto emit;		/* ~1s cache: numbers, not a string -
+					 * snprintf would be a new undefined
+					 * symbol; sysfs_emit is already ours */
+
+	for (i = 0; i < cma_blocks_n; i++) {
+		unsigned long pfn = cma_blocks[i];
+		unsigned long end = pfn + CMA_PB_NR, bf = 0;
+
+		while (pfn < end) {
+			struct page *p = pfn_to_page(pfn);
+			unsigned long step = 1;
+
+			if (PageBuddy(p)) {
+				unsigned int order =
+					(unsigned int)READ_ONCE(page_private(p));
+
+				if (order > GH_MAX_ALLOC_ORDER)
+					order = 0;	/* racy read: distrust */
+				step = min(1UL << order, end - pfn);
+				bf += step;
+			} else if (page_count(p) == 0) {
+				bf++;		/* pcp-parked / in-flight free */
+			} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+				struct folio *folio = page_folio(p);
+				unsigned long fn = folio_nr_pages(folio);
+
+				step = fn ? min(fn, end - pfn) : 1;
+				if (folio_test_anon(folio))
+					anon_p += step;
+				else if (folio_test_lru(folio))
+					file_p += step;
+#else
+				/* pre-folio kernels cannot run the reservoir
+				 * (no Gunyah, feature compile-gated) - keep
+				 * the scan compiling with page-flag spellings */
+				struct page *head = compound_head(p);
+				unsigned long fn = compound_nr(head);
+
+				step = fn ? min(fn, end - pfn) : 1;
+				if (PageAnon(head))
+					anon_p += step;
+				else if (PageLRU(head))
+					file_p += step;
+#endif
+			}
+			pfn += step;
+		}
+		free_p += bf;
+		if (bf >= CMA_PB_NR)
+			bfree++;
+		else if (bf == 0)
+			bfull++;
+		else
+			bpart++;
+		cond_resched();
+	}
+	/* feature-off / empty: no shift by an unvalidated order */
+	total_p = cma_blocks_n ? (unsigned long)cma_blocks_n << cma_pb_order : 0;
+	cma_usage_v[0] = total_p;
+	cma_usage_v[1] = free_p;
+	cma_usage_v[2] = total_p - min(free_p, total_p);
+	cma_usage_v[3] = anon_p;
+	cma_usage_v[4] = file_p;
+	cma_usage_b[0] = bfree;
+	cma_usage_b[1] = bpart;
+	cma_usage_b[2] = bfull;
+	cma_usage_jiffies = jiffies ? jiffies : 1;
+emit:
+	n = sysfs_emit(buf,
+		       "reservoir_mb=%lu\nfree_mb=%lu\nused_mb=%lu\nused_anon_mb=%lu\nused_file_mb=%lu\nblocks_free=%d\nblocks_partial=%d\nblocks_full=%d\n",
+		       cma_usage_v[0] >> (20 - PAGE_SHIFT),
+		       cma_usage_v[1] >> (20 - PAGE_SHIFT),
+		       cma_usage_v[2] >> (20 - PAGE_SHIFT),
+		       cma_usage_v[3] >> (20 - PAGE_SHIFT),
+		       cma_usage_v[4] >> (20 - PAGE_SHIFT),
+		       cma_usage_b[0], cma_usage_b[1], cma_usage_b[2]);
+	mutex_unlock(&cma_mutex);
+	return n;
+}
+
+static const struct kernel_param_ops cma_usage_ops = {
+	.get = cma_usage_get,
+};
+module_param_cb(cma_usage, &cma_usage_ops, NULL, 0400);
+MODULE_PARM_DESC(cma_usage,
+	"Reservoir occupancy snapshot: free/used/anon/file MB + block states (read-only, ~1s cached)");
 
 /* ================================================================== */
 /*  Aggressive acquire (GUI-only)                                      */
@@ -1926,9 +4307,15 @@ static void kapi_validate_disable(void)
 		tlen = strcspn(p, ", \t");
 		if (!tlen)
 			break;
+		/* Whole-token match without strlen: a matched strncmp implies
+		 * known[i] has >= tlen chars, so [tlen] is a valid read (the
+		 * NUL iff the lengths match too). strlen(known[i]) here quietly
+		 * became an out-of-line libcall on the 5.10 toolchain once the
+		 * symbol list outgrew clang's unroll threshold - a new
+		 * undefined symbol the ABI check forbids. */
 		for (i = 0; i < ARRAY_SIZE(known); i++)
-			if (strlen(known[i]) == tlen &&
-			    !strncmp(p, known[i], tlen)) {
+			if (!strncmp(p, known[i], tlen) &&
+			    known[i][tlen] == '\0') {
 				hit = true;
 				break;
 			}
@@ -1977,11 +4364,28 @@ static void kapi_init(void)
 	kapi.k_try_to_free_mem_cgroup_pages = kraw.k_try_to_free_mem_cgroup_pages ?
 						kapi_try_to_free_memcg_shim : NULL;
 
+	/* CMA reservoir setter/reader: resolved only on [6.1, 6.16). Below 6.1
+	 * there is no Gunyah to serve; from 6.16 the migratetype rework
+	 * (MIGRATE_ISOLATE becomes a standalone bit) changes pageblock-flag
+	 * semantics out from under both symbols and 6.18 makes the setter
+	 * static - so the feature auto-disables to the v9 path there, exactly
+	 * like a failed resolution would. The CMA-mode contig shim additionally
+	 * needs the preflight-supplied migratetype value. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && \
+    LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+	kapi.k_set_pageblock_migratetype = resolve_gated("set_pageblock_migratetype");
+	kapi.k_get_pfnblock_flags_mask	 = resolve_gated("get_pfnblock_flags_mask");
+#endif
+	kapi.k_alloc_contig_range_cma	 = (kraw.k_alloc_contig_range &&
+					    migrate_cma_val >= 0) ?
+						kapi_alloc_contig_range_cma_shim : NULL;
+
 	if (disable_kapi && *disable_kapi)
 		pr_info("kapi: ABI guard active, disable_kapi=\"%s\"\n", disable_kapi);
-	pr_info("kapi: id1=%d id2=%d id3=%d A(sysreclaim)=%d drain=%d drop_slab=%d\n",
+	pr_info("kapi: id1=%d id2=%d id3=%d A(sysreclaim)=%d drain=%d drop_slab=%d cma=%d\n",
 		kapi_can_v1(), kapi_can_sweep(), kapi_can_evict_b(),
-		kapi_has_sys_reclaim(), !!kapi.k_lru_add_drain_all, !!kapi.k_drop_slab);
+		kapi_has_sys_reclaim(), !!kapi.k_lru_add_drain_all, !!kapi.k_drop_slab,
+		kapi_can_cma());
 }
 
 /*
@@ -2035,6 +4439,10 @@ static bool acquire_grab_free(bool strong)
 		return false;
 	}
 	atomic_inc(&total_refilled);
+	/* §6 pairing: the block just entered the index - grab its still-free
+	 * siblings NOW, while buddy adjacency makes them likely free too
+	 * (no-op on SUBBLKS == 1). */
+	cma_grab_missing_siblings(page_to_pfn(p), CMA_SUBBLKS);
 	return true;
 }
 
@@ -2148,7 +4556,7 @@ static void acquire_worker_v1(void)
 	 *     at 0), the normal "system can't migrate any more" give-up.
 	 * msleep throttles CPU.
 	 */
-	while (atomic_read(&acquire_running) &&
+	while (atomic_read(&acquire_running) && cma_external_ok() &&
 	       atomic_read(&pool_count) + served_count < READ_ONCE(pool_want) &&
 	       fail_score < ACQUIRE_MAX_FAILS) {
 		struct page *p = kapi.k_alloc_contig_pages(nr,
@@ -2315,7 +4723,7 @@ static void acquire_sweep(enum acquire_assist assist)
 	unsigned long zstart, zend, pfn, span_pages, present_blocks;
 	unsigned long examined = 0, advanced = 0, evicted = 0, since_a = 0;
 	const char *reason = NULL;
-	int got = 0, i;
+	int got = 0, got_r = 0, i;
 	bool floor_hit = false;
 
 	if (!z || !kapi_can_sweep())
@@ -2338,15 +4746,27 @@ static void acquire_sweep(enum acquire_assist assist)
 	if (kapi.k_lru_add_drain_all)
 		kapi.k_lru_add_drain_all();		/* make PageLRU accurate for the straggler test */
 
+	/*
+	 * §6 outer condition: the sweep serves TWO consumers in fill order -
+	 * the pool while its reserve is short of pool_want (external intake
+	 * capped by cma_external_ok), then the RESERVOIR while guardianship is
+	 * short of pool_want_with_cma (Phase R: assembled windows flip to CMA
+	 * or park in limbo, never transiting the pool). Feature off reduces
+	 * both terms to the v9 condition exactly.
+	 */
 	while (atomic_read(&acquire_running) &&
-	       atomic_read(&pool_count) + served_count < READ_ONCE(pool_want)) {
+	       ((cma_external_ok() &&
+		 atomic_read(&pool_count) + served_count < READ_ONCE(pool_want)) ||
+		cma_reservoir_deficit())) {
 		struct page *head;
 		int ret;
 
 		cond_resched();
 
 		if (advanced >= span_pages) {
-			reason = "scanned all present memory";
+			reason = cma_reservoir_deficit() ?
+				 "cma sources exhausted" :
+				 "scanned all present memory";
 			break;			/* traversed the whole span once: done */
 		}
 		pfn = scan_cursor;
@@ -2418,27 +4838,54 @@ static void acquire_sweep(enum acquire_assist assist)
 		if (ret != 0)
 			continue;			/* transient/pinned: pass over it */
 
-		head = pfn_to_page(pfn);
-		rebuild_order9_compound(head);
-		if (!pool_push_grow(head)) {
-			__free_pages(head, PAGE_ORDER);
-			reason = "pool capacity full";
-			break;
+		if (atomic_read(&pool_count) + served_count <
+		    READ_ONCE(pool_want) && cma_external_ok()) {
+			/* pool first (§6 fill order) */
+			head = pfn_to_page(pfn);
+			rebuild_order9_compound(head);
+			if (!pool_push_grow(head)) {
+				__free_pages(head, PAGE_ORDER);
+				reason = "pool capacity full";
+				break;
+			}
+			atomic_inc(&total_refilled);
+			got++;
+			if (pb_enabled())	/* pairing: buddies often still free */
+				cma_grab_missing_siblings(pfn, CMA_SUBBLKS);
+		} else if (cma_reservoir_deficit()) {
+			/* Phase R: the window feeds the reservoir */
+			ret = cma_sweep_window_to_reservoir(pfn);
+			if (ret == -ENOSPC) {
+				floor_hit = true;
+				reason = "cma headroom floor";
+				break;
+			}
+			if (ret == -EIO) {
+				reason = "cma flip failed (systemic)";
+				break;
+			}
+			if (ret == 0)
+				got_r++;
+		} else {
+			/* both targets met between the check and the grab */
+			cma_span_free_to_buddy(pfn, nr);
 		}
-		atomic_inc(&total_refilled);
-		got++;
 	}
 
 	/* No break took a specific reason -> the while-condition ended it: the user
 	 * interrupted (acquire=0) or the target was reached. Surface it for the GUI. */
 	if (!reason)
-		reason = atomic_read(&acquire_running) ? "reached target"
+		reason = atomic_read(&acquire_running) ?
+			 (READ_ONCE(pool_want_with_cma) > 0 ?
+			  "reached target(with_cma)" : "reached target")
 						       : "stopped by user";
 	WRITE_ONCE(acquire_stop_reason, reason);
 
-	pr_info("acquire(%s) done: +%d pages, avail=%d want=%d evicted=%luMB scanned=%lu/%lu blocks (present=%luMB span=%luMB) floor_hit=%d\n",
-		assist == ASSIST_B ? "id3/B" : "id2/A", got, atomic_read(&pool_count),
-		READ_ONCE(pool_want), evicted >> (20 - PAGE_SHIFT),
+	pr_info("acquire(%s) done: +%d pool +%d reservoir-fed, avail=%d want=%d pool_cma=%d evicted=%luMB scanned=%lu/%lu blocks (present=%luMB span=%luMB) floor_hit=%d\n",
+		assist == ASSIST_B ? "id3/B" : "id2/A", got, got_r,
+		atomic_read(&pool_count),
+		READ_ONCE(pool_want), cma_pool_cma_2mb(),
+		evicted >> (20 - PAGE_SHIFT),
 		examined, present_blocks,
 		(present_blocks << PAGE_ORDER) >> (20 - PAGE_SHIFT),
 		span_pages >> (20 - PAGE_SHIFT), floor_hit);
@@ -2447,34 +4894,112 @@ static void acquire_sweep(enum acquire_assist assist)
 static void acquire_worker(struct work_struct *w)
 {
 	/*
+	 * v10 Phase S (before everything): when total guardianship already
+	 * meets pool_want_with_cma, the pool's shortfall comes OUT OF THE
+	 * RESERVOIR first (§6 source order) - a targeted CMA-mode grab per
+	 * block, seconds instead of a sweep, and no external memory is taken
+	 * that would push guardianship past the total target. Only when
+	 * guardianship is BELOW the total target do the external phases below
+	 * lead. Stage-in conserves guardianship 1:1, so checking once is
+	 * checking always.
+	 */
+	if (cma_capable && READ_ONCE(pool_want_with_cma) > 0) {
+		mutex_lock(&cma_mutex);
+		if (cma_guardianship_2mb() >= READ_ONCE(pool_want_with_cma))
+			cma_stage_in();
+		mutex_unlock(&cma_mutex);
+	}
+
+	/*
+	 * v10 Phase 1.5 prep (SUBBLKS > 1): refresh the derived index (cheap
+	 * insurance against overflow drift), then the pairing pass - targeted
+	 * grabs of free siblings of blocks the pool already partly owns (§6).
+	 * Both no-ops on order-9 devices.
+	 */
+	pb_rebuild();
+	cma_pair_fill();
+
+	/*
 	 * Phase 0 (all modes): drop reclaimable slab (dentry/inode) once. That slab
 	 * is not on the LRU so no acquire path can reclaim it, yet a single dentry
 	 * page poisons a whole window - freeing it up front unpoisons windows for
 	 * every mode (including v1's alloc_contig_pages and the Phase 1 fast-path).
+	 * Skipped when Phase S already met the target: dropping the system's
+	 * dentry/inode cache is a real cost, pointless with no deficit left.
 	 */
-	if (READ_ONCE(acquire_drop_slab) && kapi.k_drop_slab)
+	if (atomic_read(&pool_count) + served_count < READ_ONCE(pool_want) &&
+	    READ_ONCE(acquire_drop_slab) && kapi.k_drop_slab)
 		kapi.k_drop_slab();
 
 	/*
 	 * Phase 1 (all modes): harvest already-free order-9/10 blocks from buddy
 	 * - instant, no migration. Drains what's cheaply available (now including
 	 * blocks the slab drop just freed) before paying for migration in Phase 2.
+	 * cma_external_ok caps EXTERNAL intake at the with_cma total (§9); a
+	 * remaining pool shortfall past that point is Phase S2's job.
 	 */
-	while (atomic_read(&acquire_running) &&
+	while (atomic_read(&acquire_running) && cma_external_ok() &&
 	       atomic_read(&pool_count) + served_count < READ_ONCE(pool_want)) {
 		if (!acquire_grab_free(false))
 			break;
 		cond_resched();
 	}
 
+	/*
+	 * v10 Phase S2: pool still short after the cheap external grabs -
+	 * cannibalize the reservoir BEFORE the expensive sweep (§6 fill order:
+	 * pool first, reservoir later). This is what makes acquire fast when
+	 * assembled blocks sit in cma_blocks[] but guardianship is below the
+	 * total target (e.g. a prefill that fell short at load): VM serving
+	 * capacity must not wait minutes of zone sweep for memory the module
+	 * already guards. The reservoir deficit this leaves behind is Phase
+	 * R's to rebuild.
+	 */
+	if (cma_capable && READ_ONCE(pool_want_with_cma) > 0 &&
+	    atomic_read(&pool_count) + served_count < READ_ONCE(pool_want)) {
+		mutex_lock(&cma_mutex);
+		cma_stage_in();
+		mutex_unlock(&cma_mutex);
+	}
+
 	/* Phase 2: migration for the fragmented remainder, plus a reclaim assist:
-	 * id=3 = per-block evict (B), id=2 = system-wide reclaim (A), id=1 = old. */
+	 * id=3 = per-block evict (B), id=2 = system-wide reclaim (A), id=1 = old.
+	 * The sweep also runs Phase R (reservoir fill) per its §6 outer
+	 * condition; mode 1 remains pool-only legacy. */
 	if (READ_ONCE(acquire_mode) == 3)
 		acquire_sweep(ASSIST_B);	/* per-block evict to zram */
 	else if (READ_ONCE(acquire_mode) == 2)
 		acquire_sweep(ASSIST_A);	/* strided system-wide reclaim */
 	else
 		acquire_worker_v1();
+
+	/*
+	 * v10 tail: exchange limbo strays against full-avail pool groups (the
+	 * Phase R "待配滿/掃畢 -> 交換" step), settle limbo outcomes, then
+	 * Phase Q - when every count is met but part of the pool sits in
+	 * blocks we will never own whole, trade those strays for completable
+	 * siblings until nothing improves ("quality converged").
+	 */
+	if (cma_capable && READ_ONCE(pool_want_with_cma) > 0) {
+		mutex_lock(&cma_mutex);
+		cma_limbo_exchange();
+		cma_limbo_process();
+		mutex_unlock(&cma_mutex);
+		if (pb_enabled() && atomic_read(&acquire_running) &&
+		    atomic_read(&pool_count) + served_count >=
+			READ_ONCE(pool_want) &&
+		    cma_avail_cma_able_2mb() < atomic_read(&pool_count)) {
+			int rounds = 8;
+			bool prog = true;
+
+			while (prog && rounds-- > 0 &&
+			       atomic_read(&acquire_running))
+				prog = cma_phase_q();
+			if (!prog && atomic_read(&acquire_running))
+				WRITE_ONCE(acquire_stop_reason,
+					   "quality converged");
+		}
+	}
 	atomic_set(&acquire_running, 0);
 }
 
@@ -2504,8 +5029,11 @@ static int acquire_set(const char *val, const struct kernel_param *kp)
 		return -ENOSYS;
 	if (v == 3 && (!kapi_can_evict_b() || !acq_zone))
 		return -ENOSYS;
-	/* Nothing to do if the reserve (available + served) already meets want. */
-	if (atomic_read(&pool_count) + served_count >= READ_ONCE(pool_want)) {
+	/* Nothing to do if the pool reserve meets want AND total guardianship
+	 * meets pool_want_with_cma (§6 outer condition - a reservoir deficit
+	 * alone is enough for acquire to have Phase R work to do). */
+	if (atomic_read(&pool_count) + served_count >= READ_ONCE(pool_want) &&
+	    !cma_reservoir_deficit()) {
 		WRITE_ONCE(acquire_stop_reason, "already at target");
 		return 0;
 	}
@@ -2580,6 +5108,18 @@ static int __init hugepage_reserve_init(void)
 	 * disables/degrades a feature, never fails module load. */
 	kapi_init();
 
+	/*
+	 * v10: resolve the sweep zone early (the reservoir floor guard reads
+	 * CMA-free counts off its pgdat), then build the CMA reservoir BEFORE
+	 * the pool prefill - whole pageblocks want the cleanest memory this
+	 * boot will ever offer, and the prefill can't draw from committed
+	 * blocks anyway (GFP_KERNEL never allocates from CMA freelists). The
+	 * zone is re-resolved after the prefill as before; a pool page's zone
+	 * is the more authoritative answer once one exists.
+	 */
+	acq_zone = acq_resolve_zone();
+	cma_boot_build();
+
 	/* Prepare kretprobe struct */
 	kretp.handler       = ret_handler;
 	kretp.entry_handler = entry_handler;
@@ -2608,6 +5148,8 @@ static int __init hugepage_reserve_init(void)
 	pool_total = i;			/* capacity = what we actually got */
 	/* pool_want stays = the requested target (may exceed capacity) */
 	atomic_set(&pool_count, pool_total);
+	for (i = 0; i < pool_total; i++)	/* v10: index the prefill */
+		pb_track(page_to_pfn(page_pool[i]), PB_AVAIL, 0);
 
 	/*
 	 * An empty pool is a valid load state (boot-time memory too fragmented,
@@ -2726,6 +5268,38 @@ static void __exit hugepage_reserve_exit(void)
 	 * zone sweep (v2 has no fail-score give-up).
 	 */
 	atomic_set(&acquire_running, 0);
+
+	/*
+	 * v10: restore the CMA reservoir first (§10) - grab each block back,
+	 * flip it MOVABLE, free it - while the module's bookkeeping is fully
+	 * alive. Retried a few times: a block can be transiently ungrabbable
+	 * (racing movable allocation mid-migration). A block that still
+	 * resists is left CMA-labeled: its label and freelist stay mutually
+	 * consistent, the memory stays app-usable (movable), it merely
+	 * refuses unmovable allocations until reboot - noisy, never harmful.
+	 */
+	mutex_lock(&cma_mutex);
+	{
+		int pass;
+
+		for (pass = 0; pass < 3 && cma_blocks_n; pass++) {
+			cma_reservoir_demolish(0, true);
+			if (cma_blocks_n)
+				msleep(100);
+		}
+	}
+	if (cma_blocks_n)
+		pr_err("cma: %d reservoir block(s) left CMA-labeled at exit\n",
+		       cma_blocks_n);
+	mutex_unlock(&cma_mutex);
+
+	/* v10: free the limbo strays (held order-9 compounds). */
+	{
+		struct page *lp;
+
+		while ((lp = limbo_del_idx(0)))
+			__free_pages(lp, PAGE_ORDER);
+	}
 
 	/*
 	 * Remove all probes FIRST, cancel works second. The create/destroy

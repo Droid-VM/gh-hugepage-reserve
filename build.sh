@@ -85,6 +85,21 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 	exit 1
 fi
 echo "All builds succeeded."
+
+# Device binaries (kapi_check + balloon) are NOT committed: build them the
+# same way CI does (QEMU arm64 container) so the local zip is complete.
+# Best-effort - without arm64 docker support the zip ships without them
+# (post-fs-data fail-opens: module loads, CMA reservoir stays off).
+if docker run --rm --platform linux/arm64 -v "${TOP_DIR}:/src" debian:bookworm \
+	bash -c 'apt-get update -qq >/dev/null && \
+		apt-get install -y -qq gcc libbpf-dev libelf-dev zlib1g-dev libzstd-dev >/dev/null && \
+		gcc -O2 -Wall -I/src/abi /src/abi/kapi_check.c -lbpf -lelf -lz -lzstd -static -o /src/package/kapi_check && \
+		gcc -O2 -Wall -static -o /src/package/balloon /src/tools/balloon.c'; then
+	echo "built package/kapi_check + package/balloon (aarch64 static)"
+else
+	echo "WARNING: device binaries not rebuilt (arm64 docker unavailable)"
+fi
+
 pushd package
 rm -f "${TOP_DIR}/gh-hugepage-reserve.zip"
 zip -r "${TOP_DIR}/gh-hugepage-reserve.zip" .

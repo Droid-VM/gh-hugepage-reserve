@@ -42,6 +42,12 @@ reclaim_pages	6.12.0	*	func	ulong	list_head*	id3
 lru_add_drain_all	*	*	func	void	void	id2,id3
 drop_slab	*	*	func	void	void	id2,id3
 drain_all_pages	*	*	func	void	zone*	core
+# cma (pool_want_with_cma reservoir): until 6.16 only - the 6.16 migratetype rework
+# (MIGRATE_ISOLATE standalone bit) changes pageblock-flag semantics and 6.18 makes
+# the setter static; the module compile-gates the feature off at >=6.16 (v9 path),
+# so a >=6.16 kernel needs no row (preflight skips, module never resolves).
+set_pageblock_migratetype	*	6.16.0	func	void	page*,int	cma
+get_pfnblock_flags_mask	*	6.16.0	func	ulong	page*,ulong,ulong	cma
 mem_cgroup_from_task	*	*	func	mem_cgroup*	task_struct*	A
 try_to_free_mem_cgroup_pages	*	6.12.0	func	ulong	mem_cgroup*,ulong,uint,uint	A
 try_to_free_mem_cgroup_pages	6.12.0	*	func	ulong	mem_cgroup*,ulong,uint,uint,int*	A

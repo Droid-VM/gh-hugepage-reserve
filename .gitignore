@@ -8,3 +8,6 @@
 /.vscode
 .DS_Store
 /build
+# device binaries are CI-built (see build.yml) / locally via build.sh, never committed
+/package/kapi_check
+/package/balloon

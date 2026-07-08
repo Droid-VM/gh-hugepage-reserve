@@ -1,7 +1,7 @@
 id=gh-hugepage-reserve
 name=Gunyah Hugepage Reserve
-version=v9
-versionCode=9
+version=v10
+versionCode=10
 author=BigfootACA & lateautumn & wasdwasd0105 & HuJK
 description=Kernel module for Gunyah Hugepage Reserve
 updateJson=https://api.classfun.cn/gh-hugepage-reserve/update/

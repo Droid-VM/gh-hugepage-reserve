@@ -5,6 +5,7 @@ on:
     branches: [ master, main ]
     paths:
       - '*.c'
+      - 'abi/**'
       - 'docker_exec.sh'
       - 'build.sh'
       - 'package/**'
@@ -72,6 +73,25 @@ jobs:
           path: artifacts
           pattern: ko-*
           merge-multiple: false
+
+      - name: Set up QEMU (arm64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # The device binaries are NOT committed - they are built fresh here so
+      # they always match THIS commit's abi/kapi_abi.tsv + sources (static
+      # aarch64 via a QEMU arm64 container; same recipe works locally).
+      - name: Build device binaries (kapi_check + balloon, aarch64 static)
+        run: |
+          set -e
+          docker run --rm --platform linux/arm64 -v "$PWD:/src" debian:bookworm \
+            bash -c 'apt-get update -qq >/dev/null && \
+              apt-get install -y -qq gcc libbpf-dev libelf-dev zlib1g-dev libzstd-dev >/dev/null && \
+              gcc -O2 -Wall -I/src/abi /src/abi/kapi_check.c \
+                  -lbpf -lelf -lz -lzstd -static -o /src/package/kapi_check && \
+              gcc -O2 -Wall -static -o /src/package/balloon /src/tools/balloon.c'
+          ls -l package/kapi_check package/balloon
 
       - name: Assemble package + zip
         id: pkg

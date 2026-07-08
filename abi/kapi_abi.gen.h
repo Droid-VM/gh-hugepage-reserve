@@ -14,6 +14,8 @@
 	X(lru_add_drain_all) \
 	X(drop_slab) \
 	X(drain_all_pages) \
+	X(set_pageblock_migratetype) \
+	X(get_pfnblock_flags_mask) \
 	X(mem_cgroup_from_task) \
 	X(try_to_free_mem_cgroup_pages) \
 	X(android_vh_free_one_page_bypass)
@@ -42,6 +44,8 @@ static const struct kapi_abi_row kapi_abi_table[] = {
 	{ "lru_add_drain_all", 0x000000u, 0xffffffffu, 0, "void", "void", "id2,id3" },
 	{ "drop_slab", 0x000000u, 0xffffffffu, 0, "void", "void", "id2,id3" },
 	{ "drain_all_pages", 0x000000u, 0xffffffffu, 0, "void", "zone*", "core" },
+	{ "set_pageblock_migratetype", 0x000000u, 0x061000u, 0, "void", "page*,int", "cma" },
+	{ "get_pfnblock_flags_mask", 0x000000u, 0x061000u, 0, "ulong", "page*,ulong,ulong", "cma" },
 	{ "mem_cgroup_from_task", 0x000000u, 0xffffffffu, 0, "mem_cgroup*", "task_struct*", "A" },
 	{ "try_to_free_mem_cgroup_pages", 0x000000u, 0x060c00u, 0, "ulong", "mem_cgroup*,ulong,uint,uint", "A" },
 	{ "try_to_free_mem_cgroup_pages", 0x060c00u, 0xffffffffu, 0, "ulong", "mem_cgroup*,ulong,uint,uint,int*", "A" },
