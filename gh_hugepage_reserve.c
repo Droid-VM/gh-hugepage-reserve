@@ -873,6 +873,29 @@ static bool served_del(unsigned long pfn)
 	return found;
 }
 
+/* Read-only lookup: is this pfn currently lent out to a VM? Used by the
+ * acquire sweep to skip windows whose pages a guest's stage-2 maps -
+ * migrating those (they are LRU + mlocked, and pin coverage on the lend
+ * path is unverified) silently breaks the guest mapping: the guest then
+ * SIGBUSes on pages the host considers happily migrated. */
+static bool served_contains(unsigned long pfn)
+{
+	unsigned long flags;
+	u16 n;
+	bool found = false;
+
+	raw_spin_lock_irqsave(&served_lock, flags);
+	for (n = served_bucket[served_hash(pfn)]; n != SERVED_NULL;
+	     n = served_nodes[n].next) {
+		if (served_nodes[n].pfn == pfn) {
+			found = true;
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&served_lock, flags);
+	return found;
+}
+
 /* Physical scavenger for hook-missed frees - defined after the pool helpers
  * it needs; called from the pcp-drain worker and from reconcile below. */
 static int served_reacquire_free_orphans(void);
@@ -4633,6 +4656,8 @@ static bool block_candidate(struct zone *z, unsigned long pfn)
 #endif
 	   )
 		return false;			/* CMA/isolated/atomic: never touch */
+	if (served_contains(pfn))
+		return false;			/* lent to a VM: stage-2 maps these pages */
 
 	for (i = pfn; i < end; i++) {
 		struct page *p, *head;
