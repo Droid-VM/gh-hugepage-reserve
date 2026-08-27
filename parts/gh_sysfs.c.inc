@@ -1,519 +1,338 @@
-/* SPDX: part of gh_hugepage_reserve.ko - textually #included by
- * gh_hugepage_reserve.c (unity build, single translation unit). NOT compiled
- * separately and needs no include guard; all statics stay file-local.
- * Content: sysfs parameters (module_param_cb) */
+/* gh_hugepage_reserve — sysfs / module params (§10). KERNEL-only.
+ * Readers take ONE gh_pool_stats_snapshot / gh_pool_owner_stats_snapshot so a
+ * single output never mixes generations. Writers go through gh_pool_set_target
+ * (never READ/WRITE the target fields directly). On-device verified only.
+ */
 
-/* ================================================================== */
-/*  sysfs parameters                                                  */
-/* ================================================================== */
+/* ── the target knobs ──────────────────────────────────── */
+/* insmod-time snapshots: params are applied BEFORE gh_init builds the table
+ * (so pool_size_max is still 0 and set_target would clamp to 0). gh_init reads
+ * these after the table is up and applies them via set_target (§8). */
+static int gh_insmod_want = -1, gh_insmod_want_cma = -1;
 
-/* hook_enable: manual override for kretprobe */
-static int hook_enable_set(const char *val, const struct kernel_param *kp)
+static int gh_want_set(const char *val, const struct kernel_param *kp)
 {
-	int enable, ret = 0;
+	int v, rc;
+	enum gh_target_change ch;
 
-	if (kstrtoint(val, 10, &enable))
+	if (kstrtoint(val, 10, &v))
 		return -EINVAL;
-
-	mutex_lock(&hook_mutex);
-
-	if (enable && !hook_active) {
-		if (atomic_read(&pool_count) <= 0) {
-			pr_err("pool empty, cannot enable\n");
-			ret = -ENODATA;
-		} else {
-			ret = register_kretp_with_fallback();
-			if (ret == 0)
-				hook_active = true;
-		}
-	} else if (!enable && hook_active) {
-		unregister_kretprobe(&kretp);
-		hook_active = false;
-		pr_info("hook manually disabled\n");
-	}
-
-	mutex_unlock(&hook_mutex);
-	return ret;
-}
-
-static int hook_enable_get(char *buf, const struct kernel_param *kp)
-{
-	return sysfs_emit(buf, "%d\n", hook_active ? 1 : 0);
-}
-
-static const struct kernel_param_ops hook_enable_ops = {
-	.set = hook_enable_set,
-	.get = hook_enable_get,
-};
-module_param_cb(hook_enable, &hook_enable_ops, NULL, 0600);
-MODULE_PARM_DESC(hook_enable, "Alloc-side serve hook (kretprobe): 1=activate 0=deactivate");
-
-/* reclaim_enable: toggle the NEW free-path VM-return reclaim hook
- * (android_vh_free_one_page_bypass), separate from the alloc-side hook_enable.
- * 1=attach (default), 0=detach. Read reports the ACTUAL active state. */
-static int reclaim_enable_set(const char *val, const struct kernel_param *kp)
-{
-	int enable, ret = 0;
-
-	if (kstrtoint(val, 10, &enable))
-		return -EINVAL;
-	enable = !!enable;
-
-	mutex_lock(&hook_mutex);
-	WRITE_ONCE(reclaim_want, enable);
-	if (READ_ONCE(pool_ready)) {		/* runtime: apply immediately */
-		if (enable)
-			ret = free_hook_register();
+	if (!gh_pool_ready()) {			/* insmod: stash, init applies (§8) */
+		if ((enum gh_target)(long)kp->arg == GH_TARGET_WANT)
+			gh_insmod_want = v;
 		else
-			free_hook_unregister();
-	}					/* else: module_init honors the want */
-	mutex_unlock(&hook_mutex);
-	return ret;
-}
-
-static int reclaim_enable_get(char *buf, const struct kernel_param *kp)
-{
-	return sysfs_emit(buf, "%d\n", free_intercept_active ? 1 : 0);
-}
-
-static const struct kernel_param_ops reclaim_enable_ops = {
-	.set = reclaim_enable_set,
-	.get = reclaim_enable_get,
-};
-module_param_cb(reclaim_enable, &reclaim_enable_ops, NULL, 0600);
-MODULE_PARM_DESC(reclaim_enable,
-	"Free-path VM-return reclaim hook: 1=activate (default) 0=deactivate");
-
-/* pool_avail: read-only */
-static int pool_avail_get(char *buf, const struct kernel_param *kp)
-{
-	return sysfs_emit(buf, "%d\n", atomic_read(&pool_count));
-}
-
-static const struct kernel_param_ops pool_avail_ops = {
-	.get = pool_avail_get,
-};
-module_param_cb(pool_avail, &pool_avail_ops, NULL, 0400);
-MODULE_PARM_DESC(pool_avail, "Pages available in pool (read-only)");
-
-/* refill_stat: read-only status */
-static int refill_stat_get(char *buf, const struct kernel_param *kp)
-{
-	static const char * const state_names[] = {
-		"idle", "waiting", "running",
-	};
-	int state = atomic_read(&refill_status);
-	int n = 0;
-
-	n += sysfs_emit_at(buf, n, "state=%s\n", state_names[state]);
-	n += sysfs_emit_at(buf, n, "pool_avail=%d\n", atomic_read(&pool_count));
-	n += sysfs_emit_at(buf, n, "pool_total=%d\n", pool_total);
-	/* Live served-out (lent to VMs) count. owned+traced = pool_avail + served;
-	 * this can exceed pool_total after a shrink that left served pages out. */
-	n += sysfs_emit_at(buf, n, "served=%d\n", served_count);
-	n += sysfs_emit_at(buf, n, "pool_want=%d\n", READ_ONCE(pool_want));
-	n += sysfs_emit_at(buf, n, "total_served=%d\n", atomic_read(&total_served));
-	n += sysfs_emit_at(buf, n, "total_refilled=%d\n", atomic_read(&total_refilled));
-	n += sysfs_emit_at(buf, n, "active_vms=%d\n", vm_active_total());
-	n += sysfs_emit_at(buf, n, "acquire_active=%d\n", atomic_read(&acquire_running));
-	n += sysfs_emit_at(buf, n, "acquire_mode=%d\n", READ_ONCE(acquire_mode));
-	/* Free text (may contain spaces); refill_stat is '=' -split on the Java side
-	 * (parseProp: split("=",2)), so spaces are safe - no separator escaping. */
-	n += sysfs_emit_at(buf, n, "acquire_stop_reason=%s\n", READ_ONCE(acquire_stop_reason));
-	n += sysfs_emit_at(buf, n, "refill_enable=%d\n", READ_ONCE(refill_enable));
-	n += sysfs_emit_at(buf, n, "free_reclaim=%d\n", free_intercept_active ? 1 : 0);
-	/* v10 CMA reservoir block ('='-split like everything above, GUI-safe). */
-	n += sysfs_emit_at(buf, n, "pool_want_with_cma=%d\n", READ_ONCE(pool_want_with_cma));
-	n += sysfs_emit_at(buf, n, "pool_cma=%d\n", cma_pool_cma_2mb());
-	n += sysfs_emit_at(buf, n, "pool_avail_cma_able=%d\n", cma_avail_cma_able_2mb());
-	n += sysfs_emit_at(buf, n, "cma_pb_order=%d\n", cma_capable ? cma_pb_order : -1);
-
-	return n;
-}
-
-static const struct kernel_param_ops refill_stat_ops = {
-	.get = refill_stat_get,
-};
-module_param_cb(refill_stat, &refill_stat_ops, NULL, 0400);
-MODULE_PARM_DESC(refill_stat, "Refill status and statistics (read-only)");
-
-/* vm_owners: read-only per-VM-owner attribution */
-static int vm_owners_get(char *buf, const struct kernel_param *kp)
-{
-	unsigned long flags;
-	int i, count, n = 0;
-
-	spin_lock_irqsave(&vm_owner_lock, flags);
-	count = atomic_read(&vm_owner_count);
-	for (i = 0; i < count; i++) {
-		if (!vm_owners[i].mm)
-			continue;
-		/* comm is emitted last so userspace can keep spaces in it */
-		n += sysfs_emit_at(buf, n, "pid=%d served=%d comm=%s\n",
-				   vm_owners[i].tgid,
-				   atomic_read(&vm_owners[i].served),
-				   vm_owners[i].comm);
+			gh_insmod_want_cma = v;
+		return 0;
 	}
-	spin_unlock_irqrestore(&vm_owner_lock, flags);
+	if (gh_adjust_running())
+		return -EBUSY;	/* DELIBERATE (§4): ANY run chases fixed targets
+				 * for its whole life; changing them is the
+				 * explicit acquire=0 -> write -> acquire
+				 * sequence, never a mid-run swap.
+				 * acquire_active IS the writability signal. */
+	rc = gh_pool_set_target((enum gh_target)(long)kp->arg, v, &ch);
+	if (rc)
+		return rc;
+	if (ch == GH_TGT_SHRINK)
+		gh_adjust_try(GH_PROFILE_SHRINK);
+	/* GROW only records; the user presses acquire (§4) */
+	return 0;
+}
+static int gh_want_get(char *buf, const struct kernel_param *kp)
+{
+	struct gh_pool_stats st;
+	bool is_want = (enum gh_target)(long)kp->arg == GH_TARGET_WANT;
+
+	if (!gh_pool_ready())
+		return sysfs_emit(buf, "%d\n", is_want ? gh_insmod_want : gh_insmod_want_cma);
+	gh_pool_stats_snapshot(&st);
+	return sysfs_emit(buf, "%d\n", is_want ? st.want : st.want_cma);
+}
+static const struct kernel_param_ops gh_want_ops = { .set = gh_want_set, .get = gh_want_get };
+module_param_cb(pool_want, &gh_want_ops, (void *)GH_TARGET_WANT, 0600);
+module_param_cb(pool_want_with_cma, &gh_want_ops, (void *)GH_TARGET_WANT_CMA, 0600);
+
+/* ── acquire ───────────────────────────────────────────── */
+static int gh_acquire_set(const char *val, const struct kernel_param *kp)
+{
+	int v;
+
+	if (kstrtoint(val, 10, &v) || v < 0 || v > 3)
+		return -EINVAL;
+	if (!gh_pool_ready())
+		return -ENODEV;
+	if (v == 0) { gh_adjust_cancel(); return 0; }
+	/* -ENOSYS per mode: required kapi caps (§10). id1 needs contig_pages;
+	 * id2/3 need contig_range; id3 additionally evict-isolate. */
+	if (v == 1 && !gh_kapi.cap(GH_CAP_CONTIG_PAGES))
+		return -ENOSYS;
+	if ((v == 2 || v == 3) && !gh_kapi.cap(GH_CAP_CONTIG_RANGE))
+		return -ENOSYS;
+	if (v == 3 && !gh_kapi.cap(GH_CAP_EVICT_ISOLATE))
+		return -ENOSYS;
+	return gh_adjust_user_acquire(v);	/* 0 / -EBUSY */
+}
+static const struct kernel_param_ops gh_acquire_ops = { .set = gh_acquire_set };
+module_param_cb(acquire, &gh_acquire_ops, NULL, 0200);
+
+/* ── refill_stat: the 17-key contract (§10) ────────────── */
+static int gh_refill_stat_get(char *buf, const struct kernel_param *kp)
+{
+	struct gh_pool_stats st;
+	int n = 0, active_vms = 0, i;
+	struct gh_owner_stats os;
+
+	gh_pool_stats_snapshot(&st);
+	gh_pool_owner_stats_snapshot(&os);
+	for (i = 0; i < os.n; i++)
+		active_vms += os.row[i].vm_count;
+	n += sysfs_emit_at(buf, n, "state=%s\n", gh_release_active() ? "running" : "idle");
+	n += sysfs_emit_at(buf, n, "pool_avail=%d\n", st.avail);
+	n += sysfs_emit_at(buf, n, "pool_total=%d\n", st.total);
+	n += sysfs_emit_at(buf, n, "served=%d\n", st.served + st.released);
+	n += sysfs_emit_at(buf, n, "pool_want=%d\n", st.want);
+	n += sysfs_emit_at(buf, n, "total_served=%ld\n", atomic_long_read(&gh_dbg_total_served));
+	n += sysfs_emit_at(buf, n, "total_refilled=%ld\n",
+			   st.origin[GH_IN_HOOK] + st.origin[GH_IN_SWEEP] +
+			   st.origin[GH_IN_CMA] + st.origin[GH_IN_USER] + st.origin[GH_IN_REFILL]);
+	n += sysfs_emit_at(buf, n, "active_vms=%d\n", active_vms);
+	n += sysfs_emit_at(buf, n, "acquire_active=%d\n", gh_adjust_running() ? 1 : 0);
+	n += sysfs_emit_at(buf, n, "acquire_mode=%d\n", gh_user_approach == GH_APPROACH_CONTIG_ANY ? 1 :
+			   (gh_user_evict == GH_EVICT_MEMCG ? 2 : 3));
+	n += sysfs_emit_at(buf, n, "acquire_stop_reason=%s\n", gh_adjust_stop_reason_str());
+	n += sysfs_emit_at(buf, n, "refill_enable=%d\n", gh_param_refill_enable);
+	n += sysfs_emit_at(buf, n, "free_reclaim=%d\n", gh_free_hook_active() ? 1 : 0);
+	n += sysfs_emit_at(buf, n, "pool_want_with_cma=%d\n", st.want_cma);
+	n += sysfs_emit_at(buf, n, "pool_cma=%d\n", st.cma);
+	n += sysfs_emit_at(buf, n, "pool_avail_cma_able=%d\n", gh_pool_avail_cma_able());
+	n += sysfs_emit_at(buf, n, "cma_pb_order=%d\n",
+			   st.cma_params == GH_CMA_VERIFIED ? gh_cma_order : -1);
 	return n;
 }
+static const struct kernel_param_ops gh_refill_stat_ops = { .get = gh_refill_stat_get };
+module_param_cb(refill_stat, &gh_refill_stat_ops, NULL, 0400);
 
-static const struct kernel_param_ops vm_owners_ops = {
-	.get = vm_owners_get,
-};
-module_param_cb(vm_owners, &vm_owners_ops, NULL, 0400);
-MODULE_PARM_DESC(vm_owners,
-	"Per-VM-owner attribution: pid/served-pages/comm (read-only)");
+/* ── plain query files ─────────────────────────────────── */
+#define GH_RO_INT(name, expr) \
+	static int gh_##name##_get(char *b, const struct kernel_param *kp) \
+	{ struct gh_pool_stats st; gh_pool_stats_snapshot(&st); (void)st; return sysfs_emit(b, "%d\n", (expr)); } \
+	static const struct kernel_param_ops gh_##name##_ops = { .get = gh_##name##_get }; \
+	module_param_cb(name, &gh_##name##_ops, NULL, 0400)
+GH_RO_INT(pool_avail, st.avail);
+GH_RO_INT(pool_cma, st.cma);
+GH_RO_INT(pool_avail_cma_able, gh_pool_avail_cma_able());
+GH_RO_INT(pool_size_max, st.size_max);
 
-/* reconcile: write 1 to reconcile the served-page table (process context) */
-static int reconcile_set(const char *val, const struct kernel_param *kp)
+static int gh_reclaim_debug_get(char *b, const struct kernel_param *kp)
+{
+	struct gh_pool_stats st;
+
+	gh_pool_stats_snapshot(&st);
+	return sysfs_emit(b,
+		"o9_seen=%ld\ndel_hit=%ld\ndel_miss=%ld\ngate_drop=%ld\nskip_unmovable=%ld\n"
+		"reject=%ld\norphan=%ld\npurged=%ld\n"
+		"in_hook=%ld\nin_sweep=%ld\nin_cma=%ld\nin_user=%ld\nin_refill=%ld\n",
+		atomic_long_read(&gh_dbg_o9_seen), atomic_long_read(&gh_dbg_del_hit),
+		atomic_long_read(&gh_dbg_del_miss), st.gate_drop,
+		atomic_long_read(&gh_dbg_skip_unmovable),
+		st.reject, st.orphan, st.purged,
+		st.origin[GH_IN_HOOK], st.origin[GH_IN_SWEEP], st.origin[GH_IN_CMA],
+		st.origin[GH_IN_USER], st.origin[GH_IN_REFILL]);
+}
+static const struct kernel_param_ops gh_reclaim_debug_ops = { .get = gh_reclaim_debug_get };
+module_param_cb(reclaim_debug, &gh_reclaim_debug_ops, NULL, 0400);
+
+static int gh_vm_owners_get(char *b, const struct kernel_param *kp)
+{
+	struct gh_owner_stats os;
+	int i, n = 0;
+
+	gh_pool_owner_stats_snapshot(&os);
+	for (i = 0; i < os.n; i++)
+		n += sysfs_emit_at(b, n, "pid=%d vm_count=%d served=%ld abandoned=%ld comm=%s\n",
+				   os.row[i].tgid, os.row[i].vm_count, os.row[i].served,
+				   os.row[i].abandoned, os.row[i].comm);
+	return n;
+}
+static const struct kernel_param_ops gh_vm_owners_ops = { .get = gh_vm_owners_get };
+module_param_cb(vm_owners, &gh_vm_owners_ops, NULL, 0400);
+
+/* ── reconcile / manual_release / manual_refill ────────── */
+/* reconcile: legacy-compat NO-OP (§10). The pre-v12 module computed its
+ * per-owner stats and its ghost-entry cleanup inside a synchronous reconcile
+ * pass, so old apps write this knob (some once per second) before every stats
+ * read. v12 maintains the stats live and gives up on timestamps, so the effect
+ * an old app wants from this write - fresh numbers on its next read - happens
+ * by itself: accepting and doing nothing IS the faithful implementation, and
+ * it keeps a polling writer from flapping state=running (an armed round lives
+ * ~1s, §6). "Run one release round now" moved to manual_release below. */
+static int gh_reconcile_set(const char *val, const struct kernel_param *kp)
 {
 	int v;
 
 	if (kstrtoint(val, 10, &v) || v != 1)
 		return -EINVAL;
-	mutex_lock(&recon_mutex);
-	served_do_reconcile();
-	mutex_unlock(&recon_mutex);
-	return 0;
+	return 0;				/* accepted; nothing to do (§10) */
 }
+static const struct kernel_param_ops gh_reconcile_ops = { .set = gh_reconcile_set };
+module_param_cb(reconcile, &gh_reconcile_ops, NULL, 0200);
 
-static const struct kernel_param_ops reconcile_ops = {
-	.set = reconcile_set,
-};
-module_param_cb(reconcile, &reconcile_ops, NULL, 0200);
-MODULE_PARM_DESC(reconcile, "Write 1 to reconcile the served-page table");
-
-/* served_summary: read-only reconciled view of the served-page table */
-static int served_summary_get(char *buf, const struct kernel_param *kp)
-{
-	int n = 0, i;
-
-	mutex_lock(&recon_mutex);
-	n += sysfs_emit_at(buf, n, "tracked=%d\n", READ_ONCE(served_count));
-	n += sysfs_emit_at(buf, n, "overflow=%d\n", READ_ONCE(served_overflow));
-	n += sysfs_emit_at(buf, n, "live=%d\n", recon_live);
-	n += sysfs_emit_at(buf, n, "orphan_freed=%d\n", recon_orphan_freed);
-	n += sysfs_emit_at(buf, n, "orphan_inuse=%d\n", recon_orphan_inuse);
-	for (i = 0; i < recon_owner_n; i++)
-		n += sysfs_emit_at(buf, n, "owner pid=%d pages=%ld comm=%s\n",
-				   recon_owner_tgid[i], recon_owner_pages[i],
-				   recon_owner_comm[i]);
-	mutex_unlock(&recon_mutex);
-	return n;
-}
-
-static const struct kernel_param_ops served_summary_ops = {
-	.get = served_summary_get,
-};
-module_param_cb(served_summary, &served_summary_ops, NULL, 0400);
-MODULE_PARM_DESC(served_summary,
-	"Reconciled served-page table summary (read-only)");
-
-/* manual_refill: write 1 to trigger manual refill */
-static int manual_refill_set(const char *val, const struct kernel_param *kp)
-{
-	int trigger;
-
-	if (kstrtoint(val, 10, &trigger) || trigger != 1)
-		return -EINVAL;
-
-	if (!READ_ONCE(refill_enable)) {
-		pr_info("manual_refill ignored (refill_enable=0)\n");
-		return -ENODEV;
-	}
-
-	/* Purge ghost served entries before pool-full check */
-	if (!free_intercept_active)
-		served_do_reconcile();
-
-	if (atomic_read(&pool_count) + READ_ONCE(served_count) >= pool_total) {
-		pr_info("pool already full\n");
-		return 0;
-	}
-
-	if (atomic_cmpxchg(&refill_status, REFILL_IDLE, REFILL_WAITING) != REFILL_IDLE) {
-		pr_warn("refill already in progress\n");
-		return -EBUSY;
-	}
-
-	schedule_delayed_work(&refill_work, msecs_to_jiffies(100));
-	pr_info("manual refill triggered\n");
-	return 0;
-}
-
-static const struct kernel_param_ops manual_refill_ops = {
-	.set = manual_refill_set,
-};
-module_param_cb(manual_refill, &manual_refill_ops, NULL, 0200);
-MODULE_PARM_DESC(manual_refill, "Write 1 to trigger manual pool refill");
-
-/* Headroom floor for CMA flips - defined with the reservoir engine below,
- * together with the §7 class-ordered shrink pieces. */
-static bool cma_floor_ok(int nblocks);
-static int pool_extract_block(unsigned long pb, struct page **subs, int max);
-static struct page *pool_extract_pfn(unsigned long pfn);
-static unsigned long pb_find_full_avail(void);
-static unsigned long pb_find_class_c_avail(void);
-static int cma_commit_compound_block(unsigned long base, struct page **subs);
-static void cma_limbo_process(void);
-static int cma_verify_first_span(void);
-
-/*
- * pool_do_resize: change the target (pool_want).
- *   shrink (new < reserve): free available pages immediately, best effort
- *                           toward the target (served pages can't be freed).
- *   grow   (new > reserve): raise the target only; new pages are NOT
- *                           allocated here - use acquire to fill.
- *   0 = soft disable: every available page is freed now. Served pages stay
- *   tracked; whether a returning page is re-pooled is decided by the free
- *   hook against the target AT RETURN TIME (pool_count < pool_want), so
- *   want=0 lets them drain to buddy, while raising the target back first
- *   makes them re-pool normally - a soft-disable is fully reversible.
- */
-static void pool_do_resize(int newt)
-{
-	struct page *batch[32];
-	int target_avail;
-	bool flip = false;
-	int flip_budget = 0, flipped = 0;
-
-	/*
-	 * Clamp to the RAM-derived cap. A target below the currently lent-out
-	 * count is allowed and safe: shrink frees only pooled pages, and when the
-	 * lent pages are later returned the free-hook re-pools just up to
-	 * pool_want and lets the rest go to buddy - no overflow, no leak.
-	 */
-	if (newt < 0)
-		newt = 0;
-	if (newt > pool_size_max)
-		newt = pool_size_max;
-
-	WRITE_ONCE(pool_want, newt);
-
-	/*
-	 * The real reserve held is owned+traced = pool_count(avail) + served. GROW
-	 * stops here: nothing to free. pool_total is not touched - the free hook
-	 * (as served pages return) and acquire (as new pages land) raise it to
-	 * match what we actually hold.
-	 */
-	if (atomic_read(&pool_count) + served_count <= newt)
-		return;
-
-	/*
-	 * SHRINK: free available pages so owned+traced drops to newt. Served pages
-	 * can't be freed (VMs hold them), so the floor is target_avail =
-	 * max(0, newt - served). Park pool_total at that floor *first* so a
-	 * concurrently-running refill worker (whose pool_push fills whenever
-	 * pool_count < pool_total) can't re-add what we drain here; restore
-	 * pool_total = newt afterwards. The free hook doesn't need this dance -
-	 * it gates on pool_want (already = newt) and its pages can't collide with
-	 * the drain: a drained pool page was never in the served table.
-	 */
-	target_avail = newt - served_count;
-	if (target_avail < 0)
-		target_avail = 0;
-	WRITE_ONCE(pool_total, target_avail);
-
-	/*
-	 * v10 §7 class-A slice (SUBBLKS==1 devices): a drained avail page IS a
-	 * whole, aligned pageblock, so instead of losing it to buddy it can
-	 * flip straight into the CMA reservoir - this is the return leg the
-	 * one-way "-f fork" never had (shrink used to disown the memory; now
-	 * the guardianship just changes form, capped at pool_want_with_cma -
-	 * newt). Class B (served siblings) / class C (partial) and SUBBLKS>1
-	 * pairing need the pb-hash and arrive with commits 2/3; with
-	 * SUBBLKS==1 every avail page is class A. The flip happens while the
-	 * page is still OUR fully-held compound (label change is safe), then
-	 * the ordinary order-9 compound free carries it - via a short pcp
-	 * transit whose stored pcppage migratetype preserves CMA - onto its
-	 * block's CMA freelist.
-	 */
-	if (cma_capable &&
-	    READ_ONCE(pool_want_with_cma) > newt && CMA_SUBBLKS == 1) {
-		mutex_lock(&cma_mutex);
-		flip = true;
-		flip_budget = READ_ONCE(pool_want_with_cma) - newt -
-			      cma_pool_cma_2mb();
-	}
-
-	/*
-	 * v10 §7 class order (SUBBLKS > 1): drop class-C strays to buddy
-	 * first (their blocks can never complete from what we hold), flip
-	 * class-A groups whole into the reservoir second, and only then let
-	 * the generic drain below take what remains - by then that is class B
-	 * (avail members whose lent-out siblings may still return and turn
-	 * the block into class A), deliberately dropped last.
-	 */
-	if (cma_capable && CMA_SUBBLKS > 1) {
-		int budget;
-
-		mutex_lock(&cma_mutex);
-		while (atomic_read(&pool_count) > target_avail) {	/* pass C */
-			unsigned long vpfn = pb_find_class_c_avail();
-			struct page *p;
-
-			if (!vpfn)
-				break;
-			p = pool_extract_pfn(vpfn);
-			if (!p) {
-				pb_track(vpfn, 0, PB_AVAIL);	/* stale bit */
-				continue;
-			}
-			gh_page_unreserve(p);
-			__free_pages(p, PAGE_ORDER);
-			cond_resched();
-		}
-		budget = READ_ONCE(pool_want_with_cma) - newt - cma_pool_cma_2mb();
-		while (atomic_read(&pool_count) > target_avail) {	/* pass A */
-			unsigned long key = pb_find_full_avail();
-			struct page *subs[8];
-			int got, j, ret;
-
-			if (!key)
-				break;
-			got = pool_extract_block(key, subs, CMA_SUBBLKS);
-			if (!got)
-				break;	/* index/pool disagree: generic drain mops up */
-			ret = -EAGAIN;
-			if (got == CMA_SUBBLKS && budget >= CMA_SUBBLKS &&
-			    READ_ONCE(pool_want_with_cma) > newt &&
-			    cma_floor_ok(1))
-				ret = cma_commit_compound_block(
-					key << cma_pb_order, subs);
-			if (ret == 0) {
-				budget -= CMA_SUBBLKS;
-				flipped += CMA_SUBBLKS;
-				continue;
-			}
-			if (ret == -EIO)
-				cma_capable = false;
-			for (j = 0; j < got; j++) {	/* over budget/floor: buddy */
-				gh_page_unreserve(subs[j]);
-				__free_pages(subs[j], PAGE_ORDER);
-			}
-			cond_resched();
-		}
-		mutex_unlock(&cma_mutex);
-	}
-
-	/* free outside the lock to avoid the page allocator under it. */
-	for (;;) {
-		unsigned long flags;
-		int n = 0, i;
-
-		raw_spin_lock_irqsave(&pool_lock, flags);
-		while (n < 32 && atomic_read(&pool_count) > target_avail) {
-			int idx = atomic_read(&pool_count) - 1;
-
-			batch[n++] = page_pool[idx];
-			page_pool[idx] = NULL;
-			atomic_set(&pool_count, idx);
-		}
-		raw_spin_unlock_irqrestore(&pool_lock, flags);
-
-		for (i = 0; i < n; i++) {
-			struct page *pg = batch[i];
-
-			pb_track(page_to_pfn(pg), 0, PB_AVAIL);	/* leaving avail */
-			if (flip && flip_budget > 0) {
-				unsigned long pfn = page_to_pfn(pg);
-				int mt = cma_pb_mt(pfn);
-
-				/* §9 whitelist + headroom floor, like every flip */
-				if (cma_mt_flippable(mt) &&
-				    cma_blocks_n < POOL_SIZE_MAX &&
-				    cma_floor_ok(1)) {
-					kapi.k_set_pageblock_migratetype(pg,
-							migrate_cma_val);
-					if (cma_pb_mt(pfn) == migrate_cma_val) {
-						gh_page_unreserve(pg);
-						__free_pages(pg, PAGE_ORDER);
-						cma_blocks[cma_blocks_n++] = pfn;
-						flip_budget--;
-						flipped++;
-						continue;
-					}
-					/* readback failed: unflip, fall through */
-					kapi.k_set_pageblock_migratetype(pg,
-							MIGRATE_MOVABLE);
-				}
-			}
-			gh_page_unreserve(pg);
-			__free_pages(pg, PAGE_ORDER);
-		}
-		if (n == 0)
-			break;
-		cond_resched();
-	}
-
-	if (flip) {
-		/* Flush the pcp transit so CmaFree/pool_cma agree right away
-		 * (a following stage-in grab drains internally anyway; this is
-		 * for the accounting the GUI and the floor guard read). */
-		if (flipped && kapi.k_drain_all_pages)
-			kapi.k_drain_all_pages(NULL);
-		mutex_unlock(&cma_mutex);
-	}
-
-	WRITE_ONCE(pool_total, newt);
-	if (pb_enabled()) {	/* §3: resize is a limbo trigger point too */
-		mutex_lock(&cma_mutex);
-		cma_limbo_process();
-		mutex_unlock(&cma_mutex);
-	}
-	pr_info("pool shrink: want=%d avail=%d served=%d flipped_to_cma=%d pool_cma=%d\n",
-		newt, atomic_read(&pool_count), served_count, flipped,
-		cma_pool_cma_2mb());
-}
-
-/*
- * pool_want: the single target knob. Settable at insmod and at runtime via the
- * same file. At insmod (before the pool is built) we just record the value;
- * after init, a write resizes live (shrink frees now, grow raises target).
- */
-static int pool_want_set(const char *val, const struct kernel_param *kp)
+/* manual_release: run one release round now - the manual/diagnostic twin of
+ * manual_refill (kick release / kick adjust). Timestamp-driven give-up makes
+ * any frequency harmless (§6); its one real use is collecting released
+ * stragglers while idle. Not needed before any stats read. */
+static int gh_manual_release_set(const char *val, const struct kernel_param *kp)
 {
 	int v;
 
-	if (kstrtoint(val, 10, &v))
+	if (kstrtoint(val, 10, &v) || v != 1)
 		return -EINVAL;
-	if (v < 0)
-		v = 0;
-	if (v > pool_size_max)
-		v = pool_size_max;
-	if (READ_ONCE(pool_want_with_cma) > 0)
-		v = cma_align_2mb(v);	/* whole-pageblock accounting while the
-					 * reservoir is enabled (§2) */
-
-	if (!READ_ONCE(pool_ready)) {
-		WRITE_ONCE(pool_want, v);	/* boot: init will allocate toward it */
-	} else if (atomic_read(&acquire_running)) {
-		/*
-		 * Refuse to resize while the acquire worker runs: it is migrating
-		 * pages *into* the pool, and a concurrent resize would race it over
-		 * pool_total/pool_count/page_pool[]. Keep it simple and lock-free by
-		 * requiring the module to be quiescent first - write 0 to 'acquire'
-		 * to interrupt the worker, then set pool_want once it has stopped.
-		 */
-		return -EBUSY;
-	} else {
-		pool_do_resize(v);		/* runtime: live resize */
-		cma_want_follow(v);		/* grow past with_cma: total follows (§5) */
-	}
+	gh_release_run(1);
 	return 0;
 }
+static const struct kernel_param_ops gh_manual_release_ops = { .set = gh_manual_release_set };
+module_param_cb(manual_release, &gh_manual_release_ops, NULL, 0200);
 
-static int pool_want_get(char *buf, const struct kernel_param *kp)
+static int gh_manual_refill_set(const char *val, const struct kernel_param *kp)
 {
-	return sysfs_emit(buf, "%d\n", READ_ONCE(pool_want));
+	int v;
+
+	if (kstrtoint(val, 10, &v) || v != 1)
+		return -EINVAL;
+	if (!gh_param_refill_enable)
+		return -ENODEV;
+	if (gh_adjust_running())
+		return -EBUSY;			/* ABI -EBUSY: a run is already in flight —
+						 * adjust_try would be silent (vs USER) or a
+						 * pointless restart (vs background) (§10) */
+	gh_adjust_try(GH_PROFILE_RELEASE);
+	return 0;
 }
+static const struct kernel_param_ops gh_manual_refill_ops = { .set = gh_manual_refill_set };
+module_param_cb(manual_refill, &gh_manual_refill_ops, NULL, 0200);
 
-static const struct kernel_param_ops pool_want_ops = {
-	.set = pool_want_set,
-	.get = pool_want_get,
-};
-module_param_cb(pool_want, &pool_want_ops, NULL, 0600);
-MODULE_PARM_DESC(pool_want,
-	"Target pages (insmod + runtime): grow raises target, shrink frees now, 0 soft-disables");
+/* ── plain module params (§10) ─────────────────────────── */
+module_param_named(refill_enable, gh_param_refill_enable, int, 0600);
+module_param_named(acquire_drop_slab, gh_param_drop_slab, int, 0600);
+module_param_named(acquire_mem_floor_mb, gh_param_mem_floor_mb, int, 0600);
+module_param_named(debug, gh_param_debug, int, 0644);
+/* refill_delay_ms: accepted and ignored — the loader feeds it; rejecting
+ * would break the fallback ladder (§10). */
+static int gh_refill_delay_ms;
+module_param_named(refill_delay_ms, gh_refill_delay_ms, int, 0600);
 
+/* ── purge_log: what became of pages we gave up on (§10; needs debug=1) ── */
+static int gh_purge_log_get(char *b, const struct kernel_param *kp)
+{
+	struct gh_purge_log log;
+	int i, n = 0;
+
+	if (!gh_param_debug)
+		return sysfs_emit(b, "off (echo 1 > parameters/debug)\n");
+	gh_pool_purge_log_snapshot(&log);
+	n += sysfs_emit_at(b, n, "purged_total=%u shown=%d\n", log.total, log.n);
+	for (i = 0; i < log.n && n < PAGE_SIZE - 96; i++) {
+		struct page *pg = pfn_valid(log.rec[i].pfn) ?
+				  pfn_to_page(log.rec[i].pfn) : NULL;
+		int now = pg ? page_count(pg) : -1;	/* page op, not slot access */
+
+		n += sysfs_emit_at(b, n, "pfn=%lx at_purge=%d now=%d %s\n",
+				   log.rec[i].pfn, log.rec[i].count_at_purge, now,
+				   now == 0 ? "FREED" : "still held");
+	}
+	return n;
+}
+static const struct kernel_param_ops gh_purge_log_ops = { .get = gh_purge_log_get };
+module_param_cb(purge_log, &gh_purge_log_ops, NULL, 0400);
+
+/* ── served_summary (§10) ──────────────────────────────── */
+static int gh_served_summary_get(char *b, const struct kernel_param *kp)
+{
+	struct gh_pool_stats st;
+	struct gh_owner_stats os;
+	int i, n = 0;
+
+	gh_pool_stats_snapshot(&st);
+	gh_pool_owner_stats_snapshot(&os);
+	n += sysfs_emit_at(b, n, "tracked=%d\n", st.served + st.released);
+	n += sysfs_emit_at(b, n, "served=%d\n", st.served);
+	n += sysfs_emit_at(b, n, "released=%d\n", st.released);
+	n += sysfs_emit_at(b, n, "live=%ld\n", os.live_served);	/* held by live VMs */
+	n += sysfs_emit_at(b, n, "orphan=%ld\n", st.orphan);
+	n += sysfs_emit_at(b, n, "purged=%ld\n", st.purged);
+	for (i = 0; i < os.n; i++)
+		n += sysfs_emit_at(b, n, "owner pid=%d pages=%ld abandoned=%ld comm=%s\n",
+				   os.row[i].tgid, os.row[i].served,
+				   os.row[i].abandoned, os.row[i].comm);
+	/* per-owner field is named pages= — the pre-v12 ABI name the app's parser
+	 * is pinned to (§10). The VALUE is the live owner.served count; only the
+	 * label is legacy. */
+	return n;
+}
+static const struct kernel_param_ops gh_served_summary_ops = { .get = gh_served_summary_get };
+module_param_cb(served_summary, &gh_served_summary_ops, NULL, 0400);
+
+/* ── cma_usage: reservoir occupancy, ~1s cached (§10/§11) ── */
+static unsigned long gh_cu_v[5];		/* pages: total/free/used/anon/file */
+static int gh_cu_b[3];				/* blocks: free/partial/full */
+static unsigned long gh_cu_jiffies;
+static DEFINE_MUTEX(gh_cu_mutex);
+static unsigned long gh_cu_bases[POOL_CMA_BASES_MAX];
+
+static int gh_cma_usage_get(char *b, const struct kernel_param *kp)
+{
+	int nb, i, n = 0, span = gh_pool_cma_block_span();
+	unsigned long free_p = 0, anon_p = 0, file_p = 0, total_p;
+	int bfree = 0, bpart = 0, bfull = 0;
+
+	mutex_lock(&gh_cu_mutex);
+	if (gh_cu_jiffies && time_before(jiffies, gh_cu_jiffies + HZ))
+		goto emit;			/* ~1s cache */
+	nb = gh_pool_cma_block_bases(gh_cu_bases, POOL_CMA_BASES_MAX);
+	for (i = 0; i < nb; i++) {
+		unsigned long f, a, fi;
+
+		gh_kapi.cma_occupancy(gh_cu_bases[i], span, &f, &a, &fi);
+		free_p += f; anon_p += a; file_p += fi;
+		if (f >= (unsigned long)span) bfree++;
+		else if (f == 0) bfull++;
+		else bpart++;
+	}
+	total_p = (unsigned long)nb * span;
+	gh_cu_v[0] = total_p; gh_cu_v[1] = free_p;
+	gh_cu_v[2] = total_p - min(free_p, total_p);
+	gh_cu_v[3] = anon_p; gh_cu_v[4] = file_p;
+	gh_cu_b[0] = bfree; gh_cu_b[1] = bpart; gh_cu_b[2] = bfull;
+	gh_cu_jiffies = jiffies ? jiffies : 1;
+emit:
+	n = sysfs_emit(b,
+		"reservoir_mb=%lu\nfree_mb=%lu\nused_mb=%lu\nused_anon_mb=%lu\n"
+		"used_file_mb=%lu\nblocks_free=%d\nblocks_partial=%d\nblocks_full=%d\n",
+		gh_cu_v[0] >> (20 - PAGE_SHIFT), gh_cu_v[1] >> (20 - PAGE_SHIFT),
+		gh_cu_v[2] >> (20 - PAGE_SHIFT), gh_cu_v[3] >> (20 - PAGE_SHIFT),
+		gh_cu_v[4] >> (20 - PAGE_SHIFT), gh_cu_b[0], gh_cu_b[1], gh_cu_b[2]);
+	mutex_unlock(&gh_cu_mutex);
+	return n;
+}
+static const struct kernel_param_ops gh_cma_usage_ops = { .get = gh_cma_usage_get };
+module_param_cb(cma_usage, &gh_cma_usage_ops, NULL, 0400);
+
+/* ── hook_enable / reclaim_enable (§10; read ACTUAL state) ── */
+static int gh_hook_enable_set(const char *v, const struct kernel_param *kp)
+{ int x; if (kstrtoint(v, 10, &x)) return -EINVAL; return gh_hooks_serve_set(!!x); }
+static int gh_hook_enable_get(char *b, const struct kernel_param *kp)
+{ return sysfs_emit(b, "%d\n", gh_hooks_serve_active() ? 1 : 0); }
+static const struct kernel_param_ops gh_hook_enable_ops =
+	{ .set = gh_hook_enable_set, .get = gh_hook_enable_get };
+module_param_cb(hook_enable, &gh_hook_enable_ops, NULL, 0600);
+
+static int gh_reclaim_enable_set(const char *v, const struct kernel_param *kp)
+{ int x; if (kstrtoint(v, 10, &x)) return -EINVAL; return gh_hooks_reclaim_set(!!x); }
+static int gh_reclaim_enable_get(char *b, const struct kernel_param *kp)
+{ return sysfs_emit(b, "%d\n", gh_hooks_reclaim_active() ? 1 : 0); }
+static const struct kernel_param_ops gh_reclaim_enable_ops =
+	{ .set = gh_reclaim_enable_set, .get = gh_reclaim_enable_get };
+module_param_cb(reclaim_enable, &gh_reclaim_enable_ops, NULL, 0600);
+
+/* sim_cma_order / migrate_cma_val / pageblock_order_val / disable_kapi are
+ * owned by the kapi backend + unity root. */

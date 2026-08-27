@@ -1,9 +1,12 @@
 #!/bin/bash
 set -e
 TOP_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODULES=(
-	"gh_hugepage_reserve.c:gh_hugepage_reserve"
-)
+MOD_NAME=gh_hugepage_reserve
+# Older KMIs (5.10 / 5.15) cannot build the real module (it needs 6.1+ mm
+# internals); they get a functionless placeholder instead (see placeholder.c),
+# so the Magisk module still installs and loads on those kernels. The build loop
+# tries the real module first and falls back to the placeholder per tag, so this
+# list can carry every KMI without splitting it into "real" vs "placeholder".
 TAGS=(
 	android12-5.10
 	android13-5.10
@@ -34,42 +37,35 @@ if command -v awk >/dev/null 2>&1 && [ -f "${TOP_DIR}/abi/gen_kapi.awk" ]; then
 	echo "generated abi/kapi_abi.gen.h"
 fi
 
+OUT_DIR="${TOP_DIR}/package/ko/${MOD_NAME}"
+mkdir -p "$OUT_DIR"
+
+# Build one tag from a given source (real module or placeholder). docker_exec.sh
+# copies /src/<src> to build/<MOD_NAME>.c, so both produce a gh_hugepage_reserve.ko.
+build_one() {  # <tag> <src.c>
+	docker run --rm -v "${TOP_DIR}:/src:ro" -v "${OUT_DIR}:/out_${MOD_NAME}" \
+		"${IMAGE}:${1}" sh /src/docker_exec.sh "${2}:${MOD_NAME}" || true
+	[ -f "${OUT_DIR}/${1}.ko" ]
+}
+
 for TAG in "${TAGS[@]}"; do
 	echo "============================================"
-	echo "  Building all modules for ${TAG}"
+	echo "  Building ${MOD_NAME} for ${TAG}"
 	echo "============================================"
-
-	DOCKER_VOLS=("-v" "${TOP_DIR}:/src:ro")
-	MOD_ARGS=()
-	for MOD_ENTRY in "${MODULES[@]}"; do
-		MOD_NAME="${MOD_ENTRY##*:}"
-		OUT_DIR="${TOP_DIR}/package/ko/${MOD_NAME}"
-		mkdir -p "$OUT_DIR"
-		DOCKER_VOLS+=("-v" "${OUT_DIR}:/out_${MOD_NAME}")
-		MOD_ARGS+=("$MOD_ENTRY")
-	done
-
-	if docker run --rm "${DOCKER_VOLS[@]}" "${IMAGE}:${TAG}" \
-		sh /src/docker_exec.sh "${MOD_ARGS[@]}"; then
-		for MOD_ENTRY in "${MODULES[@]}"; do
-			MOD_NAME="${MOD_ENTRY##*:}"
-			TOTAL=$((TOTAL + 1))
-			SUCCESS+=("${MOD_NAME}@${TAG}")
-			echo "  -> OK: ${MOD_NAME}@${TAG}"
-		done
+	TOTAL=$((TOTAL + 1))
+	rm -f "${OUT_DIR}/${TAG}.ko"
+	if build_one "$TAG" gh_hugepage_reserve.c; then
+		SUCCESS+=("real@${TAG}")
+		echo "  -> OK (real): ${TAG}"
 	else
-		for MOD_ENTRY in "${MODULES[@]}"; do
-			MOD_NAME="${MOD_ENTRY##*:}"
-			OUT_DIR="${TOP_DIR}/package/ko/${MOD_NAME}"
-			TOTAL=$((TOTAL + 1))
-			if [ -f "${OUT_DIR}/${TAG}.ko" ]; then
-				SUCCESS+=("${MOD_NAME}@${TAG}")
-				echo "  -> OK: ${MOD_NAME}@${TAG}"
-			else
-				FAILED+=("${MOD_NAME}@${TAG}")
-				echo "  -> FAILED: ${MOD_NAME}@${TAG}"
-			fi
-		done
+		echo "  real module did not build on ${TAG}; falling back to placeholder"
+		if build_one "$TAG" placeholder.c; then
+			SUCCESS+=("placeholder@${TAG}")
+			echo "  -> OK (placeholder): ${TAG}"
+		else
+			FAILED+=("${TAG}")
+			echo "  -> FAILED (both real and placeholder): ${TAG}"
+		fi
 	fi
 	echo ""
 done
@@ -86,18 +82,18 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 echo "All builds succeeded."
 
-# Device binaries (kapi_check + balloon) are NOT committed: build them the
-# same way CI does (QEMU arm64 container) so the local zip is complete.
-# Best-effort - without arm64 docker support the zip ships without them
-# (post-fs-data fail-opens: module loads, CMA reservoir stays off).
+# Device binary (kapi_check) is NOT committed: build it the same way CI does
+# (QEMU arm64 container) so the local zip is complete. load.sh runs it against
+# /sys/kernel/btf/vmlinux for the ABI + MIGRATE_CMA preflight.
+# Best-effort - without arm64 docker support the zip ships without it
+# (load.sh fail-opens: module loads, CMA reservoir stays off).
 if docker run --rm --platform linux/arm64 -v "${TOP_DIR}:/src" debian:bookworm \
 	bash -c 'apt-get update -qq >/dev/null && \
 		apt-get install -y -qq gcc libbpf-dev libelf-dev zlib1g-dev libzstd-dev >/dev/null && \
-		gcc -O2 -Wall -I/src/abi /src/abi/kapi_check.c -lbpf -lelf -lz -lzstd -static -o /src/package/kapi_check && \
-		gcc -O2 -Wall -static -o /src/package/balloon /src/tools/balloon.c'; then
-	echo "built package/kapi_check + package/balloon (aarch64 static)"
+		gcc -O2 -Wall -I/src/abi /src/abi/kapi_check.c -lbpf -lelf -lz -lzstd -static -o /src/package/kapi_check'; then
+	echo "built package/kapi_check (aarch64 static)"
 else
-	echo "WARNING: device binaries not rebuilt (arm64 docker unavailable)"
+	echo "WARNING: kapi_check not rebuilt (arm64 docker unavailable)"
 fi
 
 pushd package

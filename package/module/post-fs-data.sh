@@ -23,5 +23,8 @@ dmesg -w &> "$DIR/dmesg.log" &
 # Preflight + insmod live in load.sh so the DroidVM app's runtime "Enable"
 # reproduces exactly this configuration (see load.sh). Everything above is
 # boot-only: the crash watchdog, the logs, and the dmesg tap.
-sh "$DIR/load.sh"
+# GH_BOOT: this is the blocking boot stage, so load.sh may spend its configured
+# boot_acquire_wait here holding userspace back while the acquire works. The
+# app's runtime enable calls the same script without it and never blocks.
+GH_BOOT=1 sh "$DIR/load.sh"
 exit 0

@@ -1,365 +1,893 @@
-# Gunyah-Hugepage-Reserve
+# gh_hugepage_reserve
 
-A `.ko` kernel module that keeps a pool of pre-assembled **2 MB
-(order-9) compound pages** and hands them to Gunyah VM (crosvm) guest RAM, so VMs
-get contiguous THP-backed memory even on a fragmented system - then **recovers**
-those pages when the VM returns them.
+**English** · [繁體中文](README_zh.md) · [简体中文](README_cn.md)
 
-Ships as a loadable module (KernelSU / APatch / Magisk friendly). Supported KMIs:
-`android15-6.1` ... `android16-6.12`, including 6.6 vendor kernels (e.g. SM8750).
+A 2MB-hugepage pool kernel module for Gunyah VMs. **`POOL_DESIGN.md` is the
+single source of truth** — this README is a map; details and evidence (including
+the measurements the design rests on) live there, and every §n below points at
+one of its sections.
 
-## Fork changes (samfor12)
+Ships as a loadable `.ko` (KernelSU / APatch / Magisk friendly). Supported KMIs:
+`android14-6.1` … `android16-6.12`, including 6.6 vendor kernels (e.g. SM8750).
+Older KMIs (5.10 / 5.15) get a functionless placeholder so the Magisk package
+still installs.
 
-Targeted at **temp-root phones** where the kernel cannot be modified
-and the free-hook (`android_vh_free_one_page_bypass`) is often absent.
+---
 
-- **Served-table reconciliation**: auto-purges ghost entries from dead VMs
-  on init, acquire (mode>=3), and manual_refill. Fixes the "pool already full"
-  deadlock when `active_vms=0` but `served` entries remain.
-- **Grace-period skip**: when the free hook is unavailable, reconcile purges
-  orphan entries immediately instead of waiting 10 s for a hook that will never fire.
-- **Aggressive prefill**: two-pass allocation with `drop_slab` + PCP drain,
-  retrying with escalated compaction on failure.
-- **`SetPageReserved`**: all pool pages marked reserved to prevent the buddy
-  allocator from handing them to apps.
-- **New parameters**: `system_reserve_mb` (default 6144), `mem_avail_min_mb`
-  (default 128), `pool_prefer_cma` (0/1).
-- **Low-memory auto-scale**: `pool_want` auto-clamps based on available RAM
-  when the system is under memory pressure.
+### Disclaimer — use at your own risk
 
-### Tested
+> This module patches core memory-management behaviour from inside the kernel:
+> it resolves unexported symbols at runtime, and deliberately migrates and
+> reclaims system memory. A mismatch with your kernel, a vendor-patched mm, or
+> plain bad luck can cause **crashes, reboots, data loss, a device that runs out
+> of memory, or anything else we did not expect**. It is developed and tested on
+> a small set of devices and kernels; anything else is uncharted. No warranty of
+> any kind is provided, express or implied — the authors are not liable for any
+> damage to your device or data. Keep a way to remove the module offline
+> (recovery / safe mode / `adb`) before installing, and back up your data first.
 
-| Device | OS | Root | Status |
-|--------|----|------|--------|
-| OnePlus 13 | ColorOS 15.0.0.861 | Temp root (KernelSU) | OK |
-| Other | - | - | Untested |
+### Prerequisite
 
-### Usage (temp-root phones)
-
-
-1. Gain temporary root,  use ksu load the module(ZIP pack):
-2. Execute **hardware restart**, obtain temporary root, and then execute * * soft restart as soon as possible**. Open DroidVM and check the module reserve panel — it should show memory being reserved.
-3. Launch a VM and verify it starts successfully. After testing, return to the reserve panel click   release the VM-used pages back into the reserve pool，Theoretically, the Memory used by VM should be returned to the reserved pool。
-4. Test complete.
-
-### **Disclaimer - use at your own risk.** 
-
-
-> This module patches core memory-management behavior from inside the kernel:  
-> It resolves unexported symbols at runtime, and deliberately migrates/reclaims system memory.  
-> A mismatch with your kernel, a vendor-patched mm, or plain bad luck can cause
-> **crashes, reboots, data loss, or a device that runs out of memory, or anything else we didn't expect**.  
-> It is developed and tested on a small set of devices and kernels; anything else is uncharted.  
-> No warranty of any kind is provided, express or implied - the authors are not liable for any damage with
-> your device or data.  
-> Keep a way to remove the module offline (recovery / safe mode / `adb`) before installing,
-> and back up your data first.  
-
-
-### **Prerequisite** - guest RAM must actually be 2 MB shmem THP, or there is nothing
-order-9 to intercept:
+Guest RAM must actually be 2MB shmem THP, or there is no order-9 allocation to
+intercept:
 
 ```sh
 echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
 ```
 
-When installed as a Magisk/KernelSU module this is applied for you at every boot
-(`service.sh`, at late_start so it wins over vendor defaults). The DroidVM app
-also sets it per VM launch, and crosvm must request huge pages.
-
-**Core invariant while running:** `pool_avail + served == pool_total`.
-If the sum drops below `pool_total`, pages leaked (were freed without being
-recovered).
-
-The module has three mechanisms: **serve**, **reclaim**, and **acquire**.
+Installed as a Magisk/KernelSU module this is applied for you at every boot
+(`package/module/service.sh`, at late_start so it wins over vendor defaults).
+The DroidVM app also sets it per VM launch, and crosvm must request huge pages.
 
 ---
 
-## 1. Serve - hand crosvm a pooled 2 MB page, and track the VM process
+## What it is for
 
-**Goal:** when a tracked VM allocates a 2 MB guest page, give it a page from the
-reserve pool instead of letting it fight the fragmented buddy allocator.
+On a Gunyah phone (demand-paging guest), a VM's guest RAM is allocated from the
+kernel in 2MB (order-9) units. After some uptime the system is inevitably
+fragmented — measured: **84% of all 2MB windows hold an unmovable hard
+straggler** (median ~50 per window, §preface) — and by then it is too late to
+assemble 2MB blocks. **Early boot is the only moment you can get them all.**
 
-This is two hooks: one learns **which processes are VMs**, the other **serves**
-those VMs from the pool.
+So the module acquires and guards a batch of 2MB pages at boot, for the long
+term:
 
-### 1a. Tracking - which processes are VMs
+- **When a VM wants them**: intercept the VM's 2MB allocations and hand out pool
+  pages instead; take them back precisely when the VM closes, ready for the next
+  VM.
+- **When no VM is using them**: guarded pages above the pool's share are flipped
+  whole-block into a `MIGRATE_CMA` **reservoir** and lent to the system (page
+  cache / mTHP), so the memory is not sitting idle; when the pool needs them
+  back, the borrowers are migrated out.
 
-A **kprobe on `gunyah_dev_vm_mgr_ioctl(GH_CREATE_VM)`** records the caller's
-`mm_struct` in the tracked-owner set (each owner carries a `vm_count`). It *only*
-tracks processes that created a VM - it never touches any page. This set is the
-scope: it's why the pool goes to VMs and not to every order-9 allocation on the
-system, and it must exist *before* serving (you can't tell "is this crosvm?" from
-an allocation alone).
-
-### 1b. Serving - hand a tracked VM a pooled page
-
-An always-on **kretprobe on `__alloc_pages`** (resolved as `__alloc_pages_noprof`
-/ `__alloc_pages` / `__alloc_pages_nodemask`; toggle **`hook_enable`**). The
-`entry_handler` filters fast - it acts only when `order == 9`, the pool is
-non-empty, **and** `current->mm` is a tracked owner (from 1a); everything else
-falls straight through.
-
-When it fires, `pool_serve` does the hand-out **and** the page-owner registration
-as one atomic step: pop a pool page, write its holder `pfn -> tgid` into the
-served-page table under the same lock, swap it in for the allocator's buddy page,
-and free that original (so memory isn't consumed twice). A page **never** leaves
-the pool without a tracking entry - if the served table is full it declines to
-serve and leaves the buddy page, so it can't hand out a page it couldn't later
-reclaim (this keeps `pool_avail + served == pool_total`).
-
-So the **holder** of each page (`pfn -> current tgid`, purpose-agnostic, updated on
-re-serve) is recorded here, at serve time - not in 1a. That table drives the
-read-only attribution files (`served_summary`, `vm_owners`, `reconcile`).
+Two user-facing targets: `pool_want` (the pool's share, I1) and
+`pool_want_with_cma` (total guardianship, I2). The external consumers are the
+management app (DroidVM), `load.sh`, and `serve_test`; the sysfs surface is an
+existing contract (§10).
 
 ---
 
-## 2. Reclaim - put a VM's returned 2 MB back into the pool (two paths)
+## Mechanism
 
-When a VM shuts down, its 2 MB guest pages come back to the kernel. Two
-independent paths return them to the pool; both can be on at once.
+### At a glance
 
-### 2a. Direct free-path hook - precise, leak-free (`reclaim_enable`, default on)
+Function only, no detail:
 
-- Rides the vendor hook **`android_vh_free_one_page_bypass`**. Because that hook
-  is not present on every KMI (and not monotonic by version), it is **located at
-  runtime by name** (`for_each_kernel_tracepoint` + `tracepoint_probe_register`)
-  rather than compiled in - so it works where present and silently disables where
-  absent.
-- Callback `gh_free_one_page_cb`: the instant an order-9 page **we served**
-  (matched by `pfn` in the served table) is about to re-enter the buddy allocator
-  (VM shutdown / memfd truncate), it is intercepted, **re-frozen as a compound
-  page**, and dropped straight back into the pool. The *exact same page* returns -
-  no re-allocation, no fragmentation, no leak.
-- Toggle: **`reclaim_enable`**. On KMIs lacking the hook it reads `0` even after
-  writing `1`.
-- **Post-destroy scavenge:** 3 s after a VM destroy the module flushes the
-  per-CPU page lists (so order-9 frees parked there reach the hook) and then
-  physically re-acquires any served page whose free the hook missed (e.g. a
-  THP split frees 512 order-0 pages the order-9 gate never sees): a targeted
-  `alloc_contig_range` on exactly that window recovers the same physical
-  block while its fragments are still coalesced in buddy. `reconcile` runs
-  the same scavenge, so stale entries are retired by taking the page back,
-  not by forgetting it.
+1. **insmod builds the pool synchronously**: `module_init` drives the pool to
+   target in its own context before returning — the load script and the app rely
+   on "when insmod returns, the pool is built".
+2. **serve**: a hook intercepts the VM's order-9 allocations and hands out a
+   pool page; if the pool is empty or the caller is not a VM, the original
+   allocation passes through untouched.
+3. **reclaim**: when the VM lets a page go, the free hook takes it back into the
+   pool by pfn; after VM shutdown the release worker actively recovers lent
+   pages, and gives up tracking anything still missing after the grace period
+   (10s).
+4. **CMA reservoir**: guarded pages above the pool's share are flipped
+   whole-block into CMA and lent to the system; when the pool runs short the
+   borrowers are migrated out and the block is taken back. The `unlock_cma`
+   side-car widens plain movable allocations into CMA so the reservoir is
+   actually borrowed from.
+5. **sysfs control / observation**: write the two want targets, press `acquire`
+   for an active harvest (including the heavy whole-zone sweep + evict modes),
+   read `refill_stat` / `cma_usage` and the other counters.
 
-### 2b. Detect-shutdown + delayed refill - the older alloc-back path (`refill_enable`, default on)
+### In detail
 
-- A kprobe on VM release (`gunyah_vm_release` / `gh_vm_free`) detects a VM
-  tearing down and, after **`refill_delay_ms`** (default 5000 ms), schedules work
-  that **re-allocates** 2 MB blocks from buddy (with compaction/reclaim, retrying
-  on fragmentation) to top the pool back up to `pool_total`.
-- Unlike 2a it does not catch the returned page; it waits and allocates fresh
-  blocks. Params: **`refill_enable`**, **`refill_delay_ms`**, **`manual_refill`**
-  (write `1` to fire one refill now).
-- On VM destroy the module also sweeps owners **per-entry**: it releases only
-  owners whose process is dead (`mm_users == 0`) or whose last VM closed - a
-  sibling VM dying (e.g. one crosvm OOM-killed) never drops the others.
+With the invariants. The core concept is **custody**: a 2MB slot either belongs
+to us or belongs to the system — the whole design has only that one boundary.
 
-> Set `refill_enable=0` to leave recovery purely to the precise free-path hook
-> (2a) - useful for verifying leak-free behaviour, since the pool then refills
-> **only** from pages a VM actually returned, never from fresh `alloc_pages`.
+**Page states** (§1) — every 2MB slot is in exactly one of:
 
----
+| state | meaning |
+|---|---|
+| `not_useable` | non-RAM / carveout / vendor CMA / ZONE_MOVABLE; decided once at insmod, never participates |
+| `external` | the system's (outside custody) |
+| `avail` | standing by in the pool |
+| `served` | lent to a VM (GUP pin + one protective reference of ours) |
+| `released` | the VM let go, destination undecided (waiting for the free hook, or for the give-up timer) |
+| `cand` | being assembled by collect_cma; cannot be served or shed |
+| `verify` | scratch window for CMA parameter verification (within one call) |
+| `cma` | the reservoir, lent to the system |
 
-## 3. Acquire - build the pool: grab at boot, then fill on demand
+**Accounting and invariants** (§1):
 
-**Boot grab (insmod).** At load, the module allocates up to `pool_want` x 2 MB
-via `alloc_pages` (with compaction) into the pool. Memory is unfragmented at
-boot, so this is the reliable way to get a large reserve.
+```
+custody   = avail + served + released + cand + verify
+held      = avail + served + released + verify
+held_cma  = held + cma
 
-- **`pool_want`** - the single target (pages). Set at insmod and at runtime:
-  grow raises the target, shrink frees the excess immediately, `0` soft-disables.
-  Capped at `pool_size_max`, computed from system RAM at insmod as
-  `min(ram - min(ram/2, 6G), 24G)` - i.e. the system keeps 6 GB (or half the
-  RAM on small devices) - and readable via the `pool_size_max` sysfs
-  parameter. A shrink (including `0`) is fully
-  reversible for pages lent out at the time: the free hook re-pools a returning
-  page iff the pool holds fewer than the target *at return time*, so raising
-  the target back before the VMs exit recovers them as usual.
+I1  held     → pool_want               (a convergence target, not an instantaneous invariant)
+I2  held_cma → effective pool_want_with_cma
+W   always pool_want <= pool_want_with_cma <= pool_size_max, or with_cma == 0 (CMA disabled);
+    when S>1 both are multiples of S (S = how many 2MB slots make up one CMA block)
+P   0 <= pool_total <= configured_total <= pool_size_max
+    (pool_total = "proven capacity": what was actually obtained and may be refilled in
+     the background — not an alias for held)
+U   CMA block consistency: the S slots of a block are all CMA or all non-CMA
+Q   minimise custody pages that are not part of a cma_able block (fewest orphan fragments)
+G   bookkeeping consistency: state / lists / counters agree (pool_check verifies when debug=1)
+```
 
-**On-demand fill (`acquire`, write-only).** Grow the pool toward `pool_want` when
-the buddy allocator has no free order-9 left. Fire-and-return: the work runs in a
-kworker - poll `refill_stat`'s `acquire_active` for completion, `echo 0` to stop
-(the scan cursor is saved and resumes next time).
+Counting `released` inside `held` is deliberate: a released page is very likely
+back within microseconds; excluding it would make the deficit spike the instant a
+VM shuts down and send the worker out to buy replacements for pages that are
+already on their way home. **The deficit only really opens at the moment we give
+up (purge).**
 
-Every `acquire` (1/2/3) runs the same three phases:
+**The four pillars** (§preface):
 
-- **Phase 0 - drop slab** (all modes): `drop_slab()` once - frees reclaimable
-  slab (dentry/inode). That slab isn't on the LRU so no reclaim path can move
-  it, yet a single slab page poisons a whole 2 MB window; dropping it unpoisons
-  windows for every mode. Toggle **`acquire_drop_slab`** (default 1; global
-  side-effect - filesystem re-lookups are slower afterwards).
-- **Phase 1 - free grab** (all modes): harvest already-free order-9/10 blocks
-  from buddy via `alloc_pages` - instant, no migration (includes blocks the
-  slab drop just freed).
-- **Phase 2 - assemble** (per mode): assemble the fragmented remainder using
-  the strategy selected by the written value:
-  - `echo 1` - **original**: `alloc_contig_pages` - blind full-zone scan.
-  - `echo 2` - **sweep + A (system-wide reclaim)**: cursor sweep +
-    `alloc_contig_range`; when migration alone can't assemble a window, a
-    **strided, bounded system-wide reclaim** (`try_to_free_mem_cgroup_pages`)
-    frees migration destinations elsewhere. Coarse, but works wherever that
-    symbol resolves.
-  - `echo 3` - **sweep + B (per-block evict)**: same sweep; when migration
-    fails, **evict the window's own folios to zram** (`folio_isolate_lru` +
-    `reclaim_pages`) so it frees in place - targeted, minimal eviction. Needs
-    the folio API (5.16+).
+1. **cma_able = a custody predicate**: it holds when every sub-slot of a CMA
+   block is inside custody. No per-block flag is stored — it is derived on the
+   fly by scanning the S adjacent slots (one cacheline when S≤4).
+2. **cma_ready = all sub-slots AVAIL**: the only legal thing to flip into CMA. A
+   served page is a `FOLL_LONGTERM` pin, and flipping a block that contains a pin
+   into CMA is a dead end (longterm GUP migrates before pinning).
+3. **Promotion/demotion happen only at the custody boundary**, all in worker
+   (sleepable) context; the atomic hot paths are O(S) worst case.
+4. **Two-level addressing, hole-immune**: a chunked absolute-coordinate table
+   (same construction as `mem_section`); ARM's huge physical-address holes cost
+   one NULL pointer in the top array.
 
-**The 2/3 sweep** is one full pass over the whole zone from a **persistent
-cursor** (a stopped/partial sweep resumes next trigger). Its feasibility gate
-(`block_candidate`) decides, **before any eviction**, whether a window can ever
-assemble and skips the rest - so it never "white-kicks" (evicts for nothing). It
-rejects windows holding:
+**serve** (§3.2/§4): a kretprobe on `__alloc_pages` return; four fast filters
+(order ≠ 9 / pool empty / not an owner / gfp without `__GFP_MOVABLE`) must all
+pass before the transfer. The transfer does owner validation + AVAIL→SERVED as
+one step under the fixed lock order pid_lock(read) → pool_lock, and takes
+`get_page()` before leaving AVAIL — that protective reference is what stops the
+order-9 compound from being split or migrated while it is out on loan. Pages are
+taken in three tiers: fragments first (`avail_non`) → then `cma_able` → and only
+last does it break a whole `cma_ready` block.
 
-- an unmovable **straggler** (slab / page table / kernel / vmalloc page),
-- a **reserved** or **longterm-pinned** page (e.g. another live VM's guest RAM),
-- CMA / isolated / highatomic pageblocks,
-- our **own pool pages** (so the sweep never re-grabs the reserve).
+**free return** (§3.2): when the free hook (tracepoint) hits one of our RELEASED
+pages, it compares held↔want and held_cma↔want_cma **inside the same pool_lock**
+and decides KEEP (rebuild the order-9 compound, move to AVAIL, bypass the
+original free) or DROP (move to EXT and let the original free continue into
+buddy). Splitting that into a query call plus an edge call would be a TOCTOU, so
+it is a single event api.
 
-A **memory floor** (`acquire_mem_floor_mb`, default 512 MB, writable at runtime)
-is the sole safety brake: the sweep stops once `si_mem_available()` drops below
-it, so reclaim never drives the system toward OOM and acquire fails gracefully
-instead of hanging. Raise it if the sweep leaves the system too tight (1024 was
-the historical value). `drop_slab` + `lru_add_drain_all` up front make the gate
-accurate.
+**release** (§6): the release worker classifies each SERVED page three ways —
+`refcount==1 && !mapping` → mark RELEASED first, then `put_page` outside the
+lock; `refcount>1` → the pin is still held, look again next round;
+`page_count==0` → orphan (the hook missed the free), just mark RELEASED and let
+the existing sweep/purge exits handle it. Letting go of a served page is the EVENT
+consequence of pid death plus a short 3s grace (a live owner is never touched,
+whatever its vm_count — vm_count is only the serve gate; the grace lets the exit
+path's own frees come home as a collect, and the clock starts only at death and
+is never cleared); `released_at + GRACE=10s` governs only the RELEASED purge.
 
-> On-demand acquire is capped by physical fragmentation (unmovable pageblocks): a
-> window with even one truly-unmovable page can never be assembled at runtime. The
-> reliable large reserve is the **boot grab**; on-demand `acquire` is a best-effort
-> top-up. It is always interruptible (`echo 0`) and never OOMs (the floor).
+**CMA reservoir** (§3.2):
 
-Write return codes: `-EINVAL` (bad value), `-ENOSYS` (a required symbol didn't
-resolve - try a lower mode), `-EBUSY` (already running), `0` (started / already at
-target).
+- flip (avail→cma) only ever takes a whole `cma_ready` block, and requires
+  `cma_params_state == VERIFIED` — before the first flip,
+  `pool_verify_cma_params()` uses a fully-owned verification window to check the
+  pageblock_order boundary, the CmaFree delta and a CMA-mode grab for real; a
+  structural failure is the terminal state UNAVAILABLE.
+- stage_in (cma→avail) and drop (cma→ext) both have to grab the whole block with
+  contig first and migrate the borrowers out, and **can fail** (pin / writeback).
+  A failed block is skipped for this run, **keeps its CMA label and stays counted
+  in pool_cma** — books and labels must agree, and **"just flip the label"** is
+  forbidden (the free pages are still on the CMA freelist; flipping the label
+  alone drifts the CmaFree accounting and makes the pages invisible to unmovable
+  allocations).
+- The gfp iron rule for acquire: GFP_KERNEL family, never movable and never
+  `__GFP_CMA` — otherwise, once `unlock_cma` has widened things, acquire would
+  fish pages out of our own reservoir, and a movable page would be migrated away
+  by GUP before the `FOLL_LONGTERM` pin.
 
----
+**The concurrency contract** (§2 — the structural reasons this is race-safe):
 
-## 4. CMA reservoir (v10/v11, experimental) - give idle reserve back to apps
-
-With `pool_want_with_cma > pool_want`, the difference is kept as a **CMA
-reservoir**: whole pageblocks the module labels `MIGRATE_CMA` and leaves *free
-in buddy*. While no VM needs them, app (movable) allocations use that memory
-like any other - it is not "held" at all. But unmovable allocations can never
-enter a CMA block, so the blocks stay assemblable: before a VM starts, a
-targeted CMA-mode `alloc_contig_range` migrates the movable squatters out and
-rebuilds 2 MB pages in seconds, instead of fighting the fragmentation wall
-(measured: ~10 s for 8 GB via the reservoir vs. a sweep stalling at ~30%).
-
-`pool_want_with_cma=0` (default) disables all of it - v9 behavior exactly.
-The feature needs two preflight values the packaging scripts pass at insmod
-(`migrate_cma_val` from BTF, `pageblock_order_val` from `/proc/pagetypeinfo`),
-resolves the pageblock setter/reader from kallsyms, and self-verifies on the
-first block before labeling anything (order + accounting + grab-back checks);
-any missing piece quietly falls back to the v9 path. Available on 6.1-6.12;
-from 6.16 the kernel's migratetype rework removes the interfaces and the
-feature auto-disables. A `cma_reservoir_floor_mb` headroom floor (default
-1024 MB) refuses flips that would starve the kernel's unmovable budget.
-
-Writing `pool_want` above `pool_want_with_cma` pulls the total target along, so
-a legacy management app that only knows `pool_want` still drives the whole
-elastic loop. Writing `pool_want_with_cma` smaller demolishes the excess
-reservoir immediately (emptiest blocks first); writing `0` demolishes all of
-it. `rmmod` restores every block to `MOVABLE` before the pool is freed.
-
-**Consuming the reservoir (v11).** The claim above - "app movable allocations
-use that memory like any other" - only holds when the kernel actually routes
-plain movable allocations into CMA. A stock `restrict_cma_redirect=true` kernel
-does not: only `__GFP_CMA`-tagged allocations (small anon faults, swap-in) reach
-the CMA freelist, while the app's real working set - page cache and mTHP anon -
-carries no `__GFP_CMA` and never touches the reservoir, leaving it idle. Two
-`moveable_to_cma_*` levers open that path; both are off by default, gated behind
-the CMA feature, and inert when the vendor already opens it:
-
-- `moveable_to_cma_gfp_cma_hook` (surgical, preferred): a vendor-hook probe that
-  ORs `ALLOC_CMA` into plain movable requests, self-limited to *reservoir full*
-  plus a `cma_bypass_floor_mb` free-CMA floor (default 256 MB) so it can neither
-  race acquire nor drain CMA to exhaustion. Located by name
-  (`android_vh_alloc_flags_cma_adjust` on 6.1/6.6, `android_vh_calc_alloc_flags`
-  on 6.12) - only *our* reservoir's intake widens, vendor CMA balancing is left
-  alone.
-- `moveable_to_cma_restrict_cma_redirect_disabled` (global): flips the kernel's
-  `restrict_cma_redirect` static key off, making *all* movable eligible for
-  *all* CMA (vendor carveouts included) - heavier, process-context only, and it
-  drains pcp after the flip for the 6.6/6.12 `cma_has_pcplist` overload. Value is
-  the outcome: `1` = redirect on (movable can migrate in), `0` = blocked.
-
-`moveable_to_cma_vender_already_allowed` (RO) reports `1` when the vendor kernel
-already redirects movable -> CMA (`restrict_cma_redirect` resolved and false); a
-lever write is then a no-op and the disabled-lever read still shows `1`.
+- **Atomic per call, no cross-call invariants**: every pool api completes its
+  bookkeeping atomically under pool_lock; there is no structure that needs
+  repairing afterwards, so the ABA family has nowhere to live.
+- **APIs defend themselves**: a caller's condition checks are all advisory and
+  taken outside the lock; every public api re-validates its preconditions inside
+  the lock and no-ops if they do not hold. It never trusts the caller.
+- **Work lists hold pfn values, re-validated at the consumption point**: scan
+  sets store values, not pointers; the slot table is static and the memmap always
+  exists, so dangling is structurally impossible — only staleness can happen, and
+  that is arbitrated by the in-lock re-check at the point of use.
+- **Iteration is an index-ordered table scan, never a link walk**: the whole
+  problem class "the next the cursor points at got moved concurrently" does not
+  exist.
+- Two hard rules: (a) **never `put_page` / `__free_pages` under the lock** (the
+  free tracepoint re-enters pool_lock); (b) **change state before letting go**
+  (release marks RELEASED before putting, shed marks EXT before freeing — the
+  reverse order is a distinct kind of data loss in each case).
 
 ---
 
-## Parameter reference
+## Architecture
 
-All under `/sys/module/gh_hugepage_reserve/parameters/`.
+### Overall
 
-| File                   | Mode | Group   | Purpose                                             |
-| ---------------------- | ---- | ------- | --------------------------------------------------- |
-| `hook_enable`          | 0600 | serve   | Alloc-side serve kretprobe on/off                   |
-| `reclaim_enable`       | 0600 | reclaim | Direct free-path recovery hook on/off (2a)          |
-| `refill_enable`        | 0600 | reclaim | Detect-shutdown -> alloc-back refill on/off (2b)    |
-| `refill_delay_ms`      | 0600 | reclaim | Delay after VM shutdown before alloc-back refill    |
-| `manual_refill`        | 0200 | reclaim | Write `1` to trigger one alloc-back refill          |
-| `pool_want`            | 0600 | acquire | Target pool size (pages)                            |
-| `pool_prefer_cma`      | 0600 | acquire | Prefer CMA for new pool pages: 0=off, 1=on       |
-| `system_reserve_mb`     | 0600 | acquire | System RAM to leave untouched (MB, default 6144)  |
-| `mem_avail_min_mb`      | 0600 | acquire | Floor below which acquire stops (MB, default 128) |
-| `pool_size_max`        | 0400 | acquire | RAM-derived cap on `pool_want` (pages), read-only   |
-| `acquire`              | 0200 | acquire | `0` stop / `1` old / `2` sweep+A / `3` sweep+B      |
-| `acquire_drop_slab`    | 0600 | acquire | Drop reclaimable slab at sweep start (default 1)    |
-| `acquire_mem_floor_mb` | 0600 | acquire | Sweep stops below this `MemAvailable` (default 512) |
-| `pool_want_with_cma`   | 0600 | cma     | Total target incl. reservoir (pages); `0` = off     |
-| `cma_reservoir_floor_mb` | 0600 | cma   | Refuse flips below this non-CMA available (MB)      |
-| `moveable_to_cma_gfp_cma_hook` | 0600 | cma | Arm `__GFP_CMA` bypass so page cache / mTHP anon consume the reservoir |
-| `cma_bypass_floor_mb`  | 0600 | cma     | Bypass hook stops granting CMA below this free-CMA (MB, default 256) |
-| `moveable_to_cma_restrict_cma_redirect_disabled` | 0600 | cma | Global movable→CMA: `1` = on, `0` = blocked (flips restrict key) |
-| `moveable_to_cma_vender_already_allowed` | 0400 | cma | RO: `1` = vendor kernel already redirects movable→CMA |
-| `migrate_cma_val`      | 0400 | cma     | `MIGRATE_CMA` value from preflight; `-1` = off      |
-| `pageblock_order_val`  | 0400 | cma     | Pageblock order from preflight; `-1` = off          |
-| `pool_cma`             | 0400 | cma     | Reservoir size (2 MB-page equivalents), read-only   |
-| `pool_avail_cma_able`  | 0400 | cma     | Avail pages flippable as whole pageblocks           |
-| `cma_usage`            | 0400 | cma     | Reservoir occupancy snapshot (free/anon/file, ~1s)  |
-| `pool_avail`           | 0400 | info    | Pages currently in the pool                         |
-| `refill_stat`          | 0400 | info    | Full status + counters                              |
-| `served_summary`       | 0400 | info    | Reconciled served-page summary                      |
-| `vm_owners`            | 0400 | info    | Per-VM-owner attribution (pid / pages / comm)       |
-| `reconcile`            | 0200 | info    | Write `1` to recompute `served_summary`             |
-| `reclaim_debug`        | 0400 | info    | Free-path reclaim forensic counters                 |
+Three layers: **consumer / worker / pool api + kapi**. Consumers are grouped by
+*what they call*, and each group touches exactly one layer; the full diagram and
+the description of every edge is §0.1.
 
-`refill_stat` reports one `key=value` per line: `state`, `pool_avail`,
-`pool_total`, `served`, `pool_want`, `total_served`, `total_refilled`,
-`active_vms`, `acquire_active`, `refill_enable`, `free_reclaim`,
-`pool_want_with_cma`, `pool_cma`, `pool_avail_cma_able`, `cma_pb_order`.
-`cma_pb_order=-1` means the whole CMA side is off for this boot (missing
-symbols/preflight values, or the boot-time first-block verification failed).
+```
+consumer layer (grouped by call target; insmod/rmmod excepted — they touch every layer)
+┌────────────────────────┐ ┌───────────────────┐ ┌───────────────────┐ ┌────────────┐
+│ -> pool api            │ │ -> release worker │ │ -> adjust worker  │ │ -> kapi    │
+│ serve hook (atomic)    │ │ vm_shutdown       │ │ sysfs want shrink │ │ unlock_cma │
+│ free hook  (atomic)    │ │ vm_unshare        │ │ sysfs acquire / 0 │ │ pinprobe   │
+│ sysfs reads, vm_boot   │ │ pid-exit hooks    │ │                   │ │ (side-car) │
+└───────────┬────────────┘ └─────────┬─────────┘ └─────────┬─────────┘ └──────┬─────┘
+            │                        ▼                     ▼                  │
+            │            ┌───────────────────────┐   ┌────────────────────┐   │
+            │            │ release_worker (1s×5) │──►│ adjust_worker      │   │
+            │            │ served→released,      │   │ (10ms×MAX)         │   │
+            │            │ timed give-up, ownerGC│   │ 7-phase pipeline   │   │
+            │            └───────────┬───────────┘   └─────────┬──────────┘   │
+            ▼                        ▼                         ▼              │
+┌─────────────────────────────────────────────────────────────────────┐       │
+│ pool api   public: pool_{src}_to_{dst}(one function per edge)       │       │
+│                    + queries / actions                              │       │
+│            private: pool_private_{slot,classify,promote,demote,...} │       │
+└──────────────────────────────────┬──────────────────────────────────┘       │
+                                   ▼                                          │
+┌─────────────────────────────────────────────────────────────────────┐       │
+│ kapi   alloc_pages / alloc_contig_range / set_pageblock_migratetype │◄──────┘
+│        walk_system_ram_range / evict_range / drop_slab / drain / …  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-The app-side consumability probe is `tools/balloon.c` (static aarch64 CLI,
-shipped in the package): a pure pressure instrument - it anon-balloons until
-`MemAvailable < floor_mb` (argv), prints `cma_before_kb/cma_after_kb/
-cma_diff_kb/held_mb/stop_reason` and exits. The app writes `pool_want=0`
-first, runs it, judges the numbers itself, and records its verdict as
-`cma_probe_result=` in `settings.prop` - app-owned state the kernel module
-never sees.
-`reclaim_debug` gained `cma_leak` - a tripwire counting CMA-labeled pages that
-tried to enter the pool; it must stay 0.
+Key points:
+
+- **The hooks touch only the pool api** and make no policy decisions; **the
+  workers are the only two drivers of the state machine**, and every transition
+  goes through a public api. Every release round fires `adjust_try(RELEASE)` —
+  that is the edge background refill travels on.
+- **Kernel symbols live in the kapi layer and nowhere else**; `unlock_cma` is a
+  side-car that uses only kapi and read-only pool queries, and never touches the
+  pool, the workers or the state machine (§9).
+- **insmod/rmmod are the only consumers that touch every layer**: kapi resolve,
+  slot table construction, hook attach/detach, worker start/stop, synchronous
+  teardown. The fixed order is §8 (unload iron rule: detach hooks → stop workers
+  → hand back references).
+
+The build is a unity build: `gh_hugepage_reserve.c` includes `parts/` in order.
+The pool object and both workers are environment-agnostic, and the same sources
+also compile in userspace against `tests/shim.h` — that is the CI mock harness
+(§3.3), which replays 34 scenarios against a deterministic fake buddy. kapi /
+hooks / sysfs / unlock_cma are verified on real kernels only.
+
+### kernel api (kapi)
+
+`parts/gh_kapi.c.inc` (contract in §3.3). **The only layer in the whole module
+that touches kernel symbols**; upwards it offers one coarse adapter table,
+`gh_kapi`:
+
+```c
+bool kapi.cap(feature);                        /* CONTIG_RANGE / DROP_SLAB / ... */
+struct page *kapi.alloc_try(order, strong);
+int  kapi.contig_range(start, end, noretry);   /* half-open pfn range */
+bool kapi.candidate_range(start, end);         /* pure-read feasibility probe */
+void kapi.evict_range(mode, start, end);
+bool kapi.cma_floor_ok(nblocks);
+void kapi.drop_slab(); kapi.drain_pages(); kapi.lru_add_drain_all();
+/* … full table in parts/gh_defs.h, struct gh_kapi */
+```
+
+Design rules:
+
+- **kapi is the module's own stable ABI**: call sites always use the normalised
+  `kapi.op()`. The real symbols that diverge per kernel version (names,
+  signatures, argument/return semantics) live in a private `kraw` struct plus
+  shims, and never leak upwards.
+- **Resolution happens at load time** (a throwaway kprobe finds the address);
+  what is missing stays NULL and its `cap()` returns false — the whole feature is
+  refused at its precondition, so execution never gets half-way in and calls
+  through a mistyped pointer (a kCFI type-id mismatch is a panic).
+- **ABI guard**: `load.sh`'s `kapi_check` pre-validates signatures against
+  `/sys/kernel/btf`, and incompatible symbols are blacklisted through the
+  `disable_kapi` parameter; `abi/kapi_abi.tsv` is the symbol registry.
+- **Folio flag interpretation lives only here** (the real implementations of
+  candidate/evict). The pool object's direct contact with pages is confined to a
+  small set of redefinable primitives which the test build swaps out through the
+  shim — that is exactly what makes the whole kapi layer replaceable by the mock
+  backend, and what lets pool/worker run in userspace CI.
+
+### pool api
+
+`parts/gh_pool.c.inc`. **The pool is the object** (C has no objects, so the pool
+api *is* the object): the slot table, the three avail lists, the counters, the
+cursors, the scan sets and their locks are **all inside the pool**. Hooks,
+workers and sysfs only call public apis and take back values (pfn, counts,
+bools); they never hold `pool_lock` and never look at `top[]` or a slot.
+
+Naming convention (§3): public is `pool_{src}_to_{dst}`, **one function per
+edge**, with variants of the same edge expressed as a mode argument; private is
+`pool_private_xxx`, callable only from inside the pool. Every public api
+re-validates its own preconditions inside the lock and no-ops if they fail.
+
+The state machine (one edge = one public api, §3.1):
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                  external                                    │
+└──┬─────────▲──────▲─────────┬─────▲───────────────────▲───────────────▲──────┘
+   │acquire! │shed* │drop!    │grab!│flush              │expired/rmmod* │purge*
+   ▼         │      │         │     │                   │               │
+┌────────────┴─┐    │         │     │             ┌─────┴──────┐        │
+│    avail     ├────┼─────────┼─────┼─serve──────►│   served   │        │
+│              │◄───┼ret/sweep┼─────┼─────┐       └─────┬──────┘        │
+│              │◄───┼──┐      │     │     │             │release        │
+└──┬──────▲────┘    │  │      ▼     │     │             ▼               │
+   ▼flip  │stage_in!│  │promote     │     │       ┌────────────┐        │
+┌─────────┴────┐    │  │  ┌─────────┴──┐  └───────┤  released  ├────────┘
+│     cma      ├────┘  └──┤    cand    │          └────────────┘
+└──────────────┘          └────────────┘
+
+*  = custody exit (block demotion point)     ! = this edge has an api that can fail
+```
+
+| edge | api | caller |
+|---|---|---|
+| acquire (ext→avail) | `pool_ext_to_avail(how, …)` — the five ways are modes | adjust |
+| serve (avail→served) | `pool_avail_to_served(pid)` | serve hook (atomic) |
+| release (served→released) | `pool_served_to_released()` | release worker |
+| return (released→avail/ext) | `pool_released_return(pg)` — KEEP/DROP/MISS event api | free hook (atomic) |
+| sweep (released→avail) | `pool_released_to_avail_sweep(pfn)` | adjust |
+| purge (released→ext) | `pool_released_to_ext(EXPIRED/ALL)` | adjust / rmmod |
+| expired (served→ext) | `pool_served_to_ext(EXPIRED/ALL)` | release / rmmod |
+| flip (avail→cma) | `pool_avail_to_cma(n)` | adjust |
+| stage_in (cma→avail) | `pool_cma_to_avail(n)` | adjust |
+| drop (cma→ext) | `pool_cma_to_ext(n/ALL)` | adjust / rmmod |
+| shed (avail→ext) | `pool_avail_to_ext(n)` | adjust / rmmod |
+| grab (ext→cand) / flush | `pool_ext_to_cand(pfn)` / `pool_cand_to_ext()` | adjust |
+| promote (cand→avail) | no public api — `pool_private_promote` runs it internally | — |
+
+Internal structure (§0.2): two-level addressing
+`top[off>>30][(off>>21)&511]` (O(1) worst case; a hole is a NULL pointer). Only
+the three avail lists are maintained (`avail_non` / `avail_cma_able` /
+`avail_cma_ready`) — the only consumer that needs an atomic "give me the next
+usable one" is serve; every other state uses an index-ordered table scan or an
+O(1) scalar threshold (released's `(count, oldest)`). The block properties
+cma_able/cma_ready are not stored in a field, they are derived by scanning the S
+adjacent slots. Zero `kmalloc` at runtime — every scan set is preallocated at
+insmod.
+
+The owner registry belongs to the same pool facade but uses its own `pid_lock`
+(rwlock): an entry lives until its pid dies, and the serve hot path first
+lock-lessly filters with `pool_owner_maybe()`, taking the fixed pid→pool lock
+order only on a hit.
+
+### Consumers
+
+#### hooks
+
+`parts/gh_hooks.c.inc` (§4). The principle: **each hook makes exactly one
+pool/facade call and makes no policy decision**; the policy (keep or give up,
+target comparison) is encapsulated in the api being called.
+
+| hook | attach point | action |
+|---|---|---|
+| serve | kretprobe on `__alloc_pages` return | all four fast filters pass → `pool_avail_to_served(pid)`; NULL lets the original allocation through |
+| free | tracepoint `android_vh_free_one_page_bypass` | order-9 only → `pool_released_return(page)`; set bypass on KEEP |
+| vm_boot | kprobe (the `GH_CREATE_VM` ioctl path) | `pool_owner_add(current)` |
+| vm_shutdown / unshare | kprobe (vendor symbols; overridable by parameter) | `release_vm_shutdown/unshare(current)` (the facade updates the owner and arms release) |
+| pid death | tracepoint `sched_process_exit` (core; always present on GKI) | group_dead and in the owner table → `release_vm_exit(current)` |
+
+The serve hook's four filters are ordered by cost: order ≠ 2MB → pool empty →
+not an owner (lockless) → gfp without `__GFP_MOVABLE` (measured: dma_heap's
+unmovable order-9 allocations never come back to buddy; without this filter we
+lose 2 pages per VM). serve and free both run in **atomic** context and only
+touch O(1)–O(S) pool apis. `hook_enable` / `reclaim_enable` toggle them
+independently and read back the *actual* attach state.
+
+#### workers
+
+`parts/gh_release.c.inc` / `parts/gh_adjust.c.inc` (§5–§7). Hooks run in atomic
+context and can only do O(1)–O(S) quick moves; every slow action — asking the
+system for pages, migration, whole-table scans, verification — needs sleepable
+context and is concentrated in these two workers. They are the only two drivers
+of the state machine.
+
+**The shared model: the run counter** (§5)
+
+A worker is not a resident thread but a delayed_work on a workqueue: wake up →
+do one small slice → save progress → schedule the next wake-up. The reason for
+slicing: pool_lock is only held briefly inside a slice, so the serve/free hooks
+are never blocked behind a worker's slow action.
+
+The `run` field in the ctx is both a **switch** and a **watchdog**: each round
+decrements it and finishes at zero; anyone may write it at any time — writing 0
+means stop (at most one more round completes), writing N starts or extends it.
+Every other ctx field is written only by the worker itself from init to finish;
+outsiders who want to change the work always **hand off** (`next_profile`) and
+never edit the ctx in place — the worker may be doing a slow action outside the
+lock and will still write its ctx back at the end of the round.
+
+**release_worker — "get back the pages the VM let go"** (one round per second)
+
+Three VM events (vm_shutdown / vm_unshare / pid death) each arm 5 rounds; the
+event facade also updates the owner table (attributed vm_count decrement — pure
+serve-gate maintenance — and the dead mark). Five rounds is a guaranteed floor, not a
+ceiling. Each round does five things:
+
+1. **Collect (served→released)**: index-scan the whole table for SERVED and
+   classify each page by refcount —
+   - `refcount==1` (only our own protective reference is left) = the VM really
+     let go → mark RELEASED and stamp inside the lock, then `put_page` outside
+     it. After the put the page takes the normal free path, and as it flows
+     through the free hook `pool_released_return` decides whether to take it back
+     or let it go. "Mark before releasing" is a hard rule: in the other order the
+     free hook would not recognise the page and it would be lost.
+   - `refcount>1` = the VM's/Gunyah's pin is not released yet → do not touch it
+     this round, look again next round.
+   - `page_count==0` = **orphan**: the free already happened but the hook missed
+     it (pcp lag, or an attach gap), and our reference evaporated with the free →
+     do not put, just mark RELEASED and hand it to the existing sweep (take it
+     back) / purge (give up) exits. No new path is opened.
+2. **Death give-up (served→ext EXPIRED)**: for each SERVED, look up the owner —
+   a LIVE owner is never touched, whatever its vm_count (vm_count is only the
+   serve gate); owner dead (marked) or gone from the table = stop tracking: mark
+   EXT, drop our reference, record purge_log and `owner.abandoned++`. From then
+   on the page lives with whoever still pins it, and is none of the module's
+   business. Giving up is the EVENT consequence of pid death plus DEATH_GRACE
+   (3s) — a one-way clock started only at death, never cleared (the old
+   idle+10s clock raced a VM restart 1→0→1 into false give-ups; the grace lets
+   the exit path's own frees come home as a collect).
+3. **`drain_pages` on round 3**: an order-9 free parks in the per-CPU cache
+   (pcp) first and does not flow through the hook immediately — measured ~2 pages
+   lost per VM. Round 3 (≈3s, after the shutdown free storm has passed) drains
+   once to force them out.
+4. **Early finish / final round**: "no page can still come back (released==0) and
+   no page is waiting to be unpinned (pending==0)" → set run to 0 and finish
+   early. The final round drains again, collects once more, and does owner GC —
+   clearing only entries that are dead *and* hold no pages; an entry with
+   vm_count==0 whose pid is still alive is **kept**, because the app must be able
+   to see a suspicious pid that closed its VM but did not give the pages back
+   (D-state detection, §10).
+5. **Wake adjust**: `adjust_try(RELEASE)` every round. During the wait, held
+   still includes served/released, so there is no deficit on the books and only
+   `precise` actually has work; once DROP/EXPIRED genuinely opens a deficit,
+   cheap/full/stage_in start moving — the condition system sequences this by
+   itself, so there is no need for two profiles.
+
+**Self-extension**: rounds exhausted but pending>0 (pages still waiting on unpin
+or grace) → `run=1` for one more round. It is bounded: after at most 10 seconds
+of grace EXPIRED takes them, and RELEASED converges through purge, so it cannot
+extend forever.
+
+The design core: **give-up is an event plus a short grace (pid death + 3s),
+purge is a clock (released_at + 10s), the rounds are just the vehicle** — so a
+high-frequency `manual_release`, or several events arming rounds repeatedly,
+only cause a few extra harmless scans and never bring either forward.
+
+**adjust_worker — "drive the pool to target"** (one round per 10ms)
+
+Who triggered it decides how painful an authorisation it gets (profile, §5.1):
+
+| profile | trigger | authorised acquisition strength |
+|---|---|---|
+| `INSMOD` | boot; module_init drives it synchronously to completion | cheap + full |
+| `RELEASE` | every release worker round | precise + stage_in (+ cheap + full, gated by `refill_enable`) |
+| `SHRINK` | a want target was lowered | stage_in only |
+| `USER` | the user pressed `acquire` | everything (the only one including main) |
+
+The profile only decides which strengths open inside the ACQUIRE phase
+(**policy**); the seven-phase skeleton (**mechanism**) is not subject to the
+profile and every run walks it in order. RELEASE's target snapshot is
+additionally capped to `pool_total` (proven capacity) — background refill only
+refills what was historically actually obtained, so writing a big number into a
+knob does not quietly authorise background reclaim.
+
+**One run = a single pass through the pipeline, no loop**: each phase advances
+only when it completes naturally (which may span many rounds, each doing one
+small slice), and the run is done when the pipeline ends; not reaching the target
+is a partial, recorded in stop_reason, and retrying belongs to the next trigger.
+Acquire gets exactly one chance per run — a gap opened by a later shed never
+loops back to trigger an earlier phase, so the "grab → cannot complete → drop →
+grab again" oscillation is structurally impossible.
+
+Fixed actions at the start of every round: first purge expired released pages (an
+O(1) threshold blocks it until GRACE has actually passed — this does not wait for
+the phase cursor, which may sit in main for a long time); then **recompute five
+numbers, never cached** (the pool situation is changed by hooks at any moment):
+
+```
+held           = avail + served + released     how much is in custody now
+diff_want      = want − held                   pool share short (+) / over (−) by
+new_page_need  = want_cma − (held + cma)       total guardianship still short → must ask the system
+reserve_target = want_cma − want               how big the reservoir should be
+cma_excess     = cma − reserve_target          how much the reservoir is over by
+```
+
+The seven phases, in order:
+
+1. **PREPARE**: all five numbers on target → finish immediately (an idle run
+   exits in O(1)). A USER run with a gap pays for one `drop_slab` + pcp drain
+   (dentry/inode caches are not on the LRU so no harvest can reclaim them, yet
+   one dentry page poisons a whole 2MB window; the order-0 pages it drops land in
+   pcp, and without a drain they never merge into buddy's higher orders, leaving
+   the window that just opened invisible to the rest of the harvest). One table
+   pass builds this run's scan sets: the precise list (our own released pages
+   still sitting in buddy) and the main list (all EXT windows: gaps first, then
+   resuming from the last cursor and wrapping once). Only if the reservoir is
+   over target does it pay for one CMA occupancy probe + bucket sort (cheapest
+   blocks to move first).
+2. **ACQUIRE** — the only phase governed by the profile. Five strengths ordered
+   by "who feels the pain", dropping to the next only when one is done or stuck:
+   - **precise**: contig-grab back our own released pages (they are still sitting
+     unused in buddy). Free, hurts nobody, always first.
+   - **cheap**: pick up what buddy already has (NORETRY; give up instantly if it
+     is not there). Try a **whole block** first (S × 2MB at once, natively
+     flippable into the reservoir) — big blocks are plentiful at boot, and this
+     is how pool + reservoir get built in one go. One whole-block failure demotes
+     permanently to single pages for the rest of the run (exhausted big blocks do
+     not grow back on their own).
+   - **stage_in (cma→avail)**: pool short but total guardianship sufficient (the
+     pages are in the reservoir) → take whole blocks back from our own reservoir,
+     migrating the borrowers (page cache etc.) out. Medium pain, and only our own
+     people feel it. Can fail (a borrower is pinned); hit points `cta_hp` bound
+     it: any progress refills to 8, eight consecutive zero-progress batches give
+     up.
+   - **full**: `alloc_pages` with RETRY_MAYFAIL — let the kernel do its own
+     compaction + reclaim (possibly swapping). Heavier than cheap, lighter than
+     main; the kernel manages it, so it needs no user authorisation. Stop on
+     first failure: the kernel already tried its best and asking again gets the
+     same answer.
+   - **main**: heavy pressure, USER only. Two styles: `acquire=1` is CONTIG_ANY
+     (blind grab, the kernel picks the location; hit points `main_hp` +3 on
+     success, −1 per consecutive failure, zero = "migration exhausted");
+     `acquire=2/3` is CONTIG_AT, a **whole-zone sweep** — one window per round
+     along the main list: first a pure read of 512 `struct page`s for a
+     feasibility verdict, and **no eviction unless it passes the gate**
+     ("never white-kick": measured, 84% of windows hold a straggler that cannot
+     be moved, and without this gate we would be throwing away page cache for
+     nothing on 84% of windows); past the gate try the cheap async grab, and only
+     then evict (mode A: one system-wide memcg reclaim per 8 failed windows;
+     mode B: evict only that window's own folios) and try a sync grab once,
+     moving on either way. `mem_available` is checked before every window and
+     anything below `acquire_mem_floor_mb` (512MB) brakes immediately (measured:
+     without the brake, an RCU stall to the point of reboot). The cursor
+     "advances before acting": if a run is interrupted, the next one resumes
+     after the break point instead of retrying the same batch.
+   - **End-of-round eager flip**: regardless of strength, every round checks in
+     passing — pool share full, reservoir not full, a ready block available →
+     flip one block into CMA. Earlier is better: an avail page is completely
+     unusable to the system, while a cma page can at least be borrowed.
+3. **VERIFY_CMA**: CMA parameters still PENDING and this is an INSMOD/USER run →
+   verify once for real using a fully-owned window (pageblock boundary, CmaFree
+   accounting, CMA-mode grab-back). Only after passing does it become VERIFIED
+   and flipping is allowed; a structural failure permanently disables CMA and the
+   run falls back to pure pool mode.
+4. **COLLECT_CMA**: authorisation follows main. For blocks that are only a few
+   slots short of complete, grab the gap windows (same feasibility gate, eviction
+   allowed); what is grabbed goes into the cand isolation area and **not into the
+   pool** — putting it straight into the pool would push held above want and wake
+   shed up to dismantle our own scaffolding. Block complete → promote: cand
+   becomes AVAIL, its siblings rejoin, and an equal number of fragment pages is
+   freed to conserve the total (held unchanged, quality Q improved). Any cand
+   still incomplete at the end of the run is flushed back to the system (its
+   block cannot be completed anyway, so keeping it is pointless).
+5. **AVAIL_TO_CMA**: flip the ready blocks above the pool's share in batches
+   (≤8 blocks per round) until the reservoir reaches `reserve_target`. Each flip
+   asks `cma_floor_ok` first — every flipped block takes 2MB×S of room away from
+   the unmovable working set (~3.5GB, which cannot enter CMA), so nothing is
+   flipped below the floor (default 1024MB). If this phase flipped anything it
+   drains once so the CmaFree accounting catches up (the GUI reads it).
+6. **CMA_FREE**: want_cma was lowered → give the excess reservoir blocks back to
+   the system. Per block: grab the whole block back (migrating the borrowers,
+   **which can fail**) → only with the whole block in hand flip the label back to
+   MOVABLE → free. A block that cannot be grabbed keeps its CMA label and stays
+   counted (books and labels must agree, never "just flip the label"); hit points
+   `drop_hp` reaching zero means "cma sources stuck", and the next trigger probes
+   and tries again. One exception makes way: if the pool is still short and this
+   run still has stage_in authorisation, this phase is skipped so the excess is
+   left for stage_in to convert rather than released.
+7. **AVAIL_FREE**: last, genuinely surplus avail pages (≤32 per round) go back to
+   the system. avail already empty but the books still over (all the surplus is
+   in a VM's hands) → do not wait, just finish — when they come back, the free
+   hook's DROP gate will let them go against the then-current target, or a later
+   trigger's run will shed them; without this exit the run would spin to the
+   watchdog limit (20 minutes).
+
+**Preemption and hand-off** (`adjust_try`): no run in flight → start immediately.
+A USER run in flight → nobody may preempt it (what the user pressed wins; a
+second press returns -EBUSY and needs `acquire=0` to cancel first). A background
+run in flight → the new trigger writes run to 0 (interrupt) and registers
+`next_profile` (highest priority wins: USER > SHRINK > RELEASE > INSMOD) and
+returns immediately; when the worker wraps up it sees next_profile and restarts
+under the new profile. Hand-off latency is ≤ one round (10ms), and the ctx is
+written only by the worker from beginning to end.
+
+**Finishing** (`adjust_finish`): every path that brings run to zero goes through
+this one function, with no branches — incomplete cands are returned to buddy, the
+run-local scan sets are discarded, a USER run records its stop_reason (the app
+displays it verbatim: reached target / migration exhausted / low-memory floor /
+…), and a pending next_profile is handed off. `ADJUST_RUN_MAX=120000`
+(×10ms ≈ 20 minutes) is a watchdog, not a loop length: a normal run ends
+naturally when the pipeline is done.
+
+---
+
+## Source layout, build and test
+
+| file | layer | tested |
+|---|---|---|
+| `parts/gh_defs.h` | shared types, kapi adapter contract, enums | — |
+| `parts/gh_owner.c.inc` | owner registry (pid-lifetime entries; vm_count is only the serve gate) | mock |
+| `parts/gh_pool.c.inc` | **the pool object**: all state + locks live here | mock |
+| `parts/gh_release.c.inc` | release worker (served→released, timed give-up) | mock |
+| `parts/gh_adjust.c.inc` | adjust worker (the 7-phase acquire/flip pipeline) | mock |
+| `parts/gh_kernel_env.h` | kernel primitive glue (locks, clock, page ops) | on-device |
+| `parts/gh_kapi.c.inc` | kernel kapi backend (symbol resolve, version shims) | on-device |
+| `parts/gh_hooks.c.inc` | kretprobe / kprobe / tracepoint attach | on-device |
+| `parts/gh_sysfs.c.inc` | sysfs / module params (the ABI, §10) | on-device |
+| `parts/gh_unlock_cma.c.inc` | movable→CMA bypass levers (§9) | on-device |
+| `parts/gh_pinprobe.c.inc` | `/dev/gh_pinprobe` read-only pin-feasibility probe | on-device |
+| `tests/` | mock harness: shim, fake buddy, scenarios | CI |
+| `tier1/` | QEMU integration rig (companion `.ko` + exerciser) | CI |
+
+```sh
+make test              # Tier-0: userspace mock harness (ASan+UBSan, then TSan); no kernel
+make module KDIR=...   # the kernel .ko (against a GKI build tree)
+make -C tier1 ...      # Tier-1: QEMU integration rig (see tier1/README.md)
+./build.sh             # all KMIs in Docker + the Magisk/KernelSU package
+```
+
+Testing has three tiers. **Tier 0** (`tests/`, this repo's CI) proves the pool
+logic with no kernel: `make test` builds `tests/harness.c` and replays 34
+scenarios covering serve/return, event-driven death give-up + grace, the serve
+gate across a VM restart, u32-timestamp wrap, two-owner mm-less attribution,
+orphan/purge, S=2 block classification, the CMA reservoir (flip/stage-in/drop/
+verify including the pageblock-order off-by-one), whole-zone sweep with eviction,
+shrink, profile preemption/hand-off and the hook-less (temp-root) release→sweep
+loop, plus a 4-phase TSan race harness (serve/return vs workers, overlapping
+teardowns, serve mid-acquire, and the operator resizing/acquiring/cancelling
+into the storm). **Tier 1** (`tier1/`, QEMU, run locally) compiles the real `.ko` and
+fires its kprobes/tracepoints on real pages under *induced* fragmentation — no
+device, no Gunyah. **Tier 2** is on-device (real `FOLL_LONGTERM`, real
+fragmentation, vendor quirks).
+
+---
+
+## sysfs / parameter reference
+
+All files live under `/sys/module/gh_hugepage_reserve/parameters/`. The names,
+formats and error codes are a **contract** with three external consumers (§10):
+the management app (polls `refill_stat` line by line, writes the two wants,
+presses `acquire`, writes `reconcile` before stats reads (one app spans both
+module generations: required by pre-v12, a no-op on v12), compares
+`stop_reason` strings, draws
+`cma_usage`), `load.sh` (preflight arguments + the fallback ladder), and
+`serve_test`.
+
+### Targets and control
+
+| file | mode | purpose |
+|---|---|---|
+| `pool_want` | 0600 | pool share target (2MB pages) |
+| `pool_want_with_cma` | 0600 | total guardianship target incl. reservoir; `0` disables CMA |
+| `acquire` | 0200 | `0` cancel / `1` CONTIG_ANY / `2` sweep + system-wide reclaim (mode A) / `3` sweep + per-window evict (mode B) |
+| `reconcile` | 0200 | legacy-compat no-op — accepted for old apps; stats are live, there is nothing to reconcile |
+| `manual_release` | 0200 | write `1` → one extra release round; writing often never shortens a grace period |
+| `manual_refill` | 0200 | write `1` → `adjust_try(RELEASE)` |
+| `hook_enable` | 0600 | serve kretprobe on/off; reads back the **actual** attach state |
+| `reclaim_enable` | 0600 | free tracepoint on/off; reads back the actual attach state |
+
+Write rules (§4): both wants are clamped to `pool_size_max` and, when CMA is
+usable and S>1, aligned up to a multiple of S; coupling keeps
+`want <= want_cma` (writing a bigger want raises with_cma; writing a with_cma
+below want raises it to want — it never shrinks want). Lowering either value
+clamps `pool_total` and fires `adjust_try(SHRINK)` asynchronously; *raising* a
+value only records it — someone still has to press `acquire`.
+
+Error codes: `-EINVAL` (bad value), `-ENODEV` (insmod not finished),
+`-EBUSY` (for the wants: ANY adjust run is in flight; for `acquire`: a USER run
+is), `-ENOSYS` (a required symbol did not resolve — for `acquire`: 1 needs
+contig_pages, 2 needs contig_range, 3 additionally needs folio_isolate_lru +
+reclaim_pages; for `pool_want_with_cma`: CMA is UNAVAILABLE). `-EBUSY` on want
+writes while a run is in flight is deliberate, not defensive: every run chases
+the target it snapshotted at start, and the only way to change targets is
+`acquire=0` (stop the running run) → write → press `acquire` again;
+`acquire_active=1` in `refill_stat` is exactly the "writes are blocked" signal.
+
+### Observation
+
+| file | mode | contents |
+|---|---|---|
+| `refill_stat` | 0400 | 17 `key=value` lines (below) |
+| `pool_avail` | 0400 | pages standing by in the pool |
+| `pool_cma` | 0400 | reservoir size (in 2MB-page equivalents) |
+| `pool_avail_cma_able` | 0400 | avail pages belonging to a cma_able block (0 unless VERIFIED) |
+| `pool_size_max` | 0400 | RAM-derived cap on both wants |
+| `reclaim_debug` | 0400 | `o9_seen`, `del_hit`, `del_miss`, `gate_drop`, `skip_unmovable`, `reject`, `orphan`, `purged`, `in_hook`, `in_sweep`, `in_cma`, `in_user`, `in_refill` |
+| `vm_owners` | 0400 | one line per owner: pid / vm_count / served / abandoned / comm |
+| `served_summary` | 0400 | tracked / live / orphan counts, computed by the release round |
+| `purge_log` | 0400 | pfn / refcount / current state of given-up pages (needs `debug=1`) |
+| `cma_usage` | 0400 | reservoir occupancy (free/anon/file MB, block tri-state), ~1s cache |
+
+`refill_stat` fields: `state`, `pool_avail`, `pool_total` (proven capacity,
+§5.1), `served` (= served + released), `pool_want`, `total_served`,
+`total_refilled`, `active_vms`, `acquire_active`, `acquire_mode`,
+`acquire_stop_reason`, `refill_enable`, `free_reclaim` (the free hook's real
+state), `pool_want_with_cma`, `pool_cma`, `pool_avail_cma_able`, `cma_pb_order`.
+`acquire_active` reflects whether the adjust worker has a run in flight at all
+(**any profile**, release-triggered background refills and SHRINK included); =1
+also means want writes return -EBUSY and the CMA bypass pauses lending.
+`acquire_mode` / `acquire_stop_reason` reflect **USER runs only** — a background
+run never overwrites them. `cma_pb_order=-1` means the whole CMA side is off for
+this boot (missing symbols/preflight values, or verification failed).
+
+`acquire_stop_reason` is a fixed string set the app compares verbatim: `idle` /
+`acquiring` / `already at target` / `pool capacity full` / `cma headroom floor` /
+`cma flip failed (systemic)` / `stopped by user` / `reached target` /
+`reached target,with_cma` / `migration exhausted` / `cma sources exhausted` /
+`scanned all present memory` / `low-memory floor` / `evict-B unavailable` /
+`quality converged` / `cma sources stuck`.
+
+`vm_owners` doubles as a stuck-VM detector. `abandoned` counts pages let go when
+the pid DIED still holding them; for a live pid it is always 0 (there is no
+abandon-while-alive anymore). The live-pid stuck signal is vm_count==0 with
+served>0 persisting: crosvm's teardown is slow or stuck, and the pages are still
+on the SERVED books — the app can read `/proc/<pid>/stat` and flag a D state.
+
+### Movable→CMA levers (§9)
+
+| file | mode | purpose |
+|---|---|---|
+| `moveable_to_cma_vender_already_allowed` | 0400 | `1` = the vendor kernel already redirects movable→CMA, so a lever write is a no-op |
+| `moveable_to_cma_gfp_cma_hook` | 0600 | surgical, preferred: a vendor-hook probe that ORs `ALLOC_CMA` into plain movable requests |
+| `moveable_to_cma_restrict_cma_redirect_disabled` | 0600 | global: flips the kernel's `restrict_cma_redirect` static key; `1` = movable may migrate in |
+
+Without one of these the reservoir is "guarded, but nobody can borrow it": a
+stock kernel routes only `__GFP_CMA`-tagged allocations to the CMA freelist,
+while the app's real working set (page cache, mTHP anon) carries no such tag.
+Both levers are off by default, gated on the reservoir being built and harvesting
+being quiet (prefill finished and NO adjust run in flight — any profile can reach
+CMA-touching stages, not just a user-pressed acquire), and refuse to grant CMA
+below `cma_bypass_floor_mb`.
+
+### Module parameters
+
+| parameter | mode | default | purpose |
+|---|---|---|---|
+| `pool_want` / `pool_want_with_cma` | 0600 | 0 | as above; also settable at insmod |
+| `system_reserve_mb` | 0400 | 6144 (floor 64) | RAM left to the system when computing `pool_size_max = min(ram − min(ram/2, system_reserve_mb), table cap)` |
+| `system_reserve_mb_default` | 0400 | computed | **This device's** default reserve, `min(RAM/2, 6144)`, settled at init — not the built-in constant, which the RAM/2 cap makes wrong on small phones (8GB: the 6144 default keeps only 4096, and configuring anything above 4096 is a no-op). A configured value overwrites `system_reserve_mb`, so this is the only place the default survives; the app needs it as the threshold for "you are lowering the reserve" |
+| `migrate_cma_val` | 0400 | −1 | preflight: the runtime `MIGRATE_CMA` value (from BTF) |
+| `pageblock_order_val` | 0400 | −1 | preflight: pageblock order (from `/proc/pagetypeinfo`) |
+| `disable_kapi` | 0400 | — | preflight: comma-separated blacklist of symbols whose BTF signature drifted |
+| `cma_reservoir_floor_mb` | 0600 | 512 | refuse a flip below this much non-CMA headroom |
+| `acquire_mem_floor_mb` | 0600 | 512 | the sweep brakes below this `MemAvailable` |
+| `cma_bypass_floor_mb` | 0600 | 256 | the movable→CMA hook stops granting below this free CMA |
+| `acquire_drop_slab` | 0600 | 1 | drop reclaimable slab once at the start of a USER run |
+| `refill_enable` | 0600 | 1 | gates only RELEASE's cheap+full; free return, precise, stage_in and EXPIRED run regardless |
+| `debug` | 0644 | 0 | enable `pool_check` per round and the `purge_log` file |
+| `sim_cma_order` | 0400 | 0 | test only: force the S>1 bookkeeping paths on an S==1 device |
+| `vm_create_sym` / `vm_destroy_sym` / `vm_reclaim_sym` | 0400 | — | override the kprobe target symbol names |
+| `refill_delay_ms` | 0600 | 0 | **accepted and ignored** — legacy loader compatibility (rejecting it would break the insmod line and drop `load.sh` to a lower rung) |
+
+Any of the three preflight values missing leaves CMA UNAVAILABLE; all present
+only reaches PENDING — flipping still requires passing verification.
+
+### `load.sh` / `settings.prop` contract
+
+`package/module/load.sh` is the single source of truth for "how to insmod this
+module" (both the boot path and the app's runtime re-enable run it), and it
+degrades through a ladder of insmod lines so an older `.ko` that lacks a
+parameter still loads. Its ladder deliberately relies on a strict kernel
+*rejecting* an unknown parameter — which is why the module **must never define a
+parameter named `pool_target`** (the historical name carried in the ladder line).
+
+`settings.prop` keys: `pool_want`, `pool_want_with_cma`, `cma_movable_lever`
+(`hook` | `flag` → which of the two lever files to arm at insmod),
+`system_reserve_mb` (only passed when set), `cma_reservoir_floor_mb` (only
+passed when set — it rides the v10 CMA argument group rather than a new top
+rung, being a v10-era parameter, and it has to be an insmod argument rather than
+a later write to its 0600 file: the synchronous prefill inside insmod already
+builds the reservoir and consults the floor on every flip, so a write after
+insmod returns is one boot too late; note that the parameter has existed since
+v10, so its presence does *not* prove this package's `load.sh` feeds it — the
+app must compare the readback after a reload, or gate on `module.prop`'s
+versionCode), and the boot-acquire trio
+`boot_acquire` (0–3, default 0: once the module is present, `load.sh` writes that
+mode to `acquire`, stepping down 3→2→1 on `-ENOSYS`; failure is non-fatal),
+`boot_acquire_runs` (default 1) and `boot_acquire_wait` (seconds, default 0).
+All three are **loader policy, not module parameters** — it is just a USER run,
+so the app shows its progress in `refill_stat` and `acquire=0` cancels it. Their
+module params are writable (0600) *because* the module is blind to them: a write
+changes no behaviour, and it gives a saved setting somewhere visible before the
+next load. Anything the module acts on stays read-only — `system_reserve_mb`
+sizes a table built once, so a later write could only lie.
+
+The trio is what a temp-root device has instead of a button. A temp-root *soft*
+reboot restarts Android's userspace without taking the kernel down, so this
+script runs again with the `.ko` still loaded: the acquire is therefore gated on
+the module being **present**, not on this insmod having succeeded (it returns
+EEXIST there), because userspace-down-and-no-GUI-yet is the freest memory the
+module will ever see and the only window heavy pressure can use. `runs` presses
+that USER run more than once, each after the previous finished — one run is a
+single one-way pass, so windows its own eviction freed behind the sweep cursor
+are only reachable by the next run, and a run with nothing to do exits in O(1).
+`wait` is how many seconds `load.sh` may block in post-fs-data waiting for them,
+which is what actually holds zygote back while the sweep works; keep it under
+the root manager's post-fs-data timeout (Magisk: 40s), and anything left over
+finishes in the background. Blocking is a boot-path concern, so only the
+`GH_BOOT=1` caller (post-fs-data.sh) may spend that budget — the app's runtime
+"Enable" runs the same script, presses the same runs and never blocks. The defaults (0 / 1 / 0) are the old behaviour, and
+because they live in `settings.prop` on `/data` they are re-read on every soft
+reboot.
+
+### `/dev/gh_pinprobe`
+
+A read-only "would this range fail a `FOLL_LONGTERM` pin?" probe
+(`GH_PINPROBE_RANGE`, `'P'` magic, `struct gh_pinprobe_range`), ABI-identical to
+the original in `gh_unmovable.ko`, so the crosvm client needs no change. Every
+Gunyah memory transfer ends in `pin_user_pages_fast(FOLL_LONGTERM)`, and a page
+in a CMA / isolate / ZONE_MOVABLE pageblock cannot be pinned that way — the
+kernel migrates it out first, and when there is nowhere to migrate to, the
+failure lands deep inside the hypervisor call. The probe answers the cheap
+question ("is any of this in a pageblock that would need migrating?") by sampling
+one page per 2MB with `FOLL_NOFAULT`, never faulting anything in. This module
+owns it because it owns the CMA state and knows the runtime `MIGRATE_CMA` value.
 
 ---
 
 ## Usage
 
 ```sh
-# Load with a boot reserve (memory is unfragmented at boot - most reliable).
-insmod gh_hugepage_reserve.ko pool_want=1024        # 1024 x 2MB = 2 GB
+# Load with a boot reserve (memory is unfragmented at boot — by far the most reliable).
+insmod gh_hugepage_reserve.ko pool_want=1024                    # 1024 × 2MB = 2GB
 
-# Top up on demand later (per-block evict), watch progress.
+# Same, plus a 2GB CMA reservoir lent back to the system while no VM needs it.
+insmod gh_hugepage_reserve.ko pool_want=1024 pool_want_with_cma=2048 \
+       migrate_cma_val=... pageblock_order_val=...              # load.sh fills these in
+
+# Top up on demand later (mode B: per-window evict), and watch progress.
 echo 3 > .../parameters/acquire
 while grep -q 'acquire_active=1' .../parameters/refill_stat; do sleep 1; done
-cat .../parameters/refill_stat
+grep -E 'pool_avail|pool_cma|acquire_stop_reason' .../parameters/refill_stat
 
-# Verify leak-free recovery in isolation (pool refills ONLY from returned pages).
+# Change the target while a user acquire is running: cancel first, then rewrite.
+echo 0    > .../parameters/acquire
+echo 2048 > .../parameters/pool_want
+echo 3    > .../parameters/acquire
+
+# Verify leak-free recovery in isolation (the pool then refills ONLY from pages a
+# VM actually returned, never from fresh alloc_pages).
 insmod gh_hugepage_reserve.ko pool_want=256 refill_enable=0
-# ... run a VM, use it, shut it down, wait a few seconds ...
-cat .../parameters/refill_stat        # pool_avail returns; pool_avail + served == pool_total
+# ... run a VM, use it, shut it down, wait ~10s ...
+cat .../parameters/refill_stat
+cat .../parameters/reclaim_debug     # in_hook should account for the returns; reject/orphan ≈ 0
 ```
 
 (where `...` is `/sys/module/gh_hugepage_reserve/parameters`)
+
+---
+
+## Status
+
+The mock-testable core (pool object + workers) is complete and CI-green (30
+scenarios + a 4-phase TSan race harness). The kernel backend (kapi / hooks / sysfs /
+unlock_cma / pinprobe + root) compiles clean (zero warnings) against
+android14-6.1 / android15-6.6 / android16-6.12, and Tier-1 passes on all three in
+QEMU (2026-08-28): kapi fully resolved, CMA verify reaches VERIFIED (including a
+live DEFERRED retry), all six hooks attach, scenarios A–E pass, clean unload.
+
+Remaining work is Tier-2: the on-device regression on the three target devices
+(real `FOLL_LONGTERM`, vendor quirks, kCFI), plus the two `NOTE(on-device)`
+confirmations (owner write-lock irq context; the kapi coarse-adapter caveats).

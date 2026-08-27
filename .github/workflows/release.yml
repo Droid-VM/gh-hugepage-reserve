@@ -20,13 +20,12 @@ jobs:
       contents: write
     steps:
       - name: Download package zip artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
-          # archive:false artifacts must be fetched by their exact name (= file name);
-          # skip-decompress keeps the .zip as-is instead of auto-extracting it.
+          # The package job uploads the flashable zip as a single-file artifact of
+          # this exact name; v4 download extracts it back to dl/<name>.
           name: gh-hugepage-reserve-${{ needs.build.outputs.ver }}.zip
           path: dl
-          skip-decompress: true
 
       - name: Locate zip
         id: f

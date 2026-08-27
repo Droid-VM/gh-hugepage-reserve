@@ -11,3 +11,18 @@
 # device binaries are CI-built (see build.yml) / locally via build.sh, never committed
 /package/kapi_check
 /package/balloon
+
+# in-tree kernel module build output (`make module`, `make -C tier1`)
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+
+# Tier-1 QEMU rig output (built by tier1/run-qemu.sh)
+/tier1/out/
+/tier1/out_comp/
+/tier1/initramfs.cpio.gz
+/tier1/tier1_init
+/tier1/qemu*.log
