@@ -227,8 +227,16 @@ static int cma_adjust_hook_register(void)
 			return -ENOENT;
 	}
 	ret = tracepoint_probe_register(cma_adjust_tp, cma_adjust_probe_fn(), NULL);
-	if (ret == 0)
+	if (ret == 0) {
 		cma_adjust_active = true;
+		/* Which ABI era's spelling this kernel carries: <6.12 builds have
+		 * the 2-arg android_vh_alloc_flags_cma_adjust, >=6.12 the 3-arg
+		 * android_vh_calc_alloc_flags. One line in dmesg is the only
+		 * evidence the lever is attached at all (§9: no query API). */
+		pr_info("unlock_cma: gfp hook %s attached\n",
+			cma_adjust_is_calc ? "android_vh_calc_alloc_flags"
+					   : "android_vh_alloc_flags_cma_adjust");
+	}
 	return ret;
 }
 
