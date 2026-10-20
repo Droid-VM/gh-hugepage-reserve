@@ -174,6 +174,53 @@ static int get_sig(const struct btf *btf, const char *sym, int is_hook,
 	return 1;
 }
 
+/* Copy a comma-separated canonical token list, spelling every 8-bit token
+ * "char". On AArch64 plain `char` is unsigned, and the DWARF->BTF path used for
+ * GKI vmlinux does not set BTF_INT_CHAR, so canon() renders the source's `char`
+ * as "uchar" (observed: kallsyms_lookup_name expected ulong(char*), got
+ * ulong(uchar*)). Signedness of an 8-bit scalar changes neither the calling
+ * convention nor the kCFI type hash on this target, so the two spellings are
+ * ABI-identical and must not be reported as a mismatch - that false positive
+ * put kallsyms_lookup_name on the disable list of every arm64 device. */
+static void norm8(const char *in, char *out, size_t osz)
+{
+	size_t o = 0;
+
+	for (;;) {
+		size_t n = strcspn(in, ",");
+		const char *tok = in;
+		size_t tn = n;
+		int ch8 = (tn >= 5 && !strncmp(tok, "uchar", 5));
+
+		if (o + tn + 2 > osz)
+			break;
+		if (ch8) {			/* uchar, uchar*, uchar** ... */
+			memcpy(out + o, "char", 4);
+			o += 4;
+			tok += 5;
+			tn -= 5;
+		}
+		memcpy(out + o, tok, tn);
+		o += tn;
+		in += n;
+		if (*in != ',')
+			break;
+		out[o++] = ',';
+		in++;
+	}
+	out[o] = '\0';
+}
+
+/* Canonical-token equality with the char/uchar equivalence above. */
+static int sig_eq(const char *a, const char *b)
+{
+	char na[512], nb[512];
+
+	norm8(a, na, sizeof na);
+	norm8(b, nb, sizeof nb);
+	return !strcmp(na, nb);
+}
+
 static const struct kapi_abi_row *row_for(const char *sym, unsigned int kver)
 {
 	int i;
@@ -225,7 +272,24 @@ int main(int argc, char **argv)
 		size_t cur;
 
 		if (!r) {
-			fprintf(stderr, "  %-32s no table row for this kver - skip\n", sym);
+			/* No row for this kver is the normal case when the kernel
+			 * carries the OTHER ABI era's spelling of a feature: a
+			 * 6.6.57 android15 GKI has android_vh_alloc_flags_cma_adjust
+			 * (2-arg), not the >=6.12 android_vh_calc_alloc_flags
+			 * (3-arg), so the latter legitimately has no row here. Say
+			 * which it is instead of a bare "no table row", which reads
+			 * as a defect and invites a wrong table edit. */
+			char it[192];
+			__s32 id;
+
+			snprintf(it, sizeof it, "__traceiter_%s", sym);
+			id = btf__find_by_name_kind(btf, it, BTF_KIND_FUNC);
+			if (id < 0)
+				id = btf__find_by_name_kind(btf, sym, BTF_KIND_FUNC);
+			fprintf(stderr, "  %-32s %s - skip\n", sym,
+				id >= 0
+				? "no row for this kver but symbol present (table gap)"
+				: "not present on this kernel (other ABI era)");
 			continue;
 		}
 		if (!get_sig(btf, sym, r->hook, aret, sizeof aret, aparams, sizeof aparams)) {
@@ -239,7 +303,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "  %-32s MISSING in BTF (kapi stays NULL, graceful)\n", sym);
 			continue;
 		}
-		if (!strcmp(aret, r->ret) && !strcmp(aparams, r->params)) {
+		if (sig_eq(aret, r->ret) && sig_eq(aparams, r->params)) {
 			fprintf(stderr, "  %-32s OK    %s(%s)\n", sym, r->ret, r->params);
 			continue;
 		}
