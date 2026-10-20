@@ -19,7 +19,7 @@ if [ -f "$DIR/crash" ]; then
 	exit 0
 fi
 touch "$DIR/stamp"
-dmesg -w &> "$DIR/dmesg.log" &
+dmesg &> "$DIR/dmesg.log" &
 # Preflight + insmod live in load.sh so the DroidVM app's runtime "Enable"
 # reproduces exactly this configuration (see load.sh). Everything above is
 # boot-only: the crash watchdog, the logs, and the dmesg tap.
