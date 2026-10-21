@@ -17,6 +17,8 @@
  * Gated to kernel [6.1,6.16) with the rest of the CMA feature.
  */
 
+#include "gh_static_key.h"
+
 /* Free system CMA floor (MB) below which the gfp bypass stops granting
  * ALLOC_CMA to non-__GFP_CMA movable allocations — an absolute brake so the
  * bypass can never drain the reservoir to exhaustion (§9 floor gate). */
@@ -270,7 +272,7 @@ static int mtc_restrict_get_state(void)		/* -1 unavailable, else 0/1 */
 {
 	if (!mtc_restrict_key)
 		return -1;
-	return static_key_enabled(mtc_restrict_key) ? 1 : 0;
+	return gh_static_key_enabled(mtc_restrict_key) ? 1 : 0;
 }
 
 static int mtc_restrict_set_state(bool restricted)
@@ -310,8 +312,7 @@ static void gh_unlock_cma_boot_apply(void)
 	 * CMA (restrict_cma_redirect resolved AND currently false)? Just an
 	 * observation of the key, independent of capability. When 1, both levers
 	 * are redundant and their writes become accepted no-ops. */
-	mtc_vender_already_allowed =
-		(mtc_restrict_key && !static_key_enabled(mtc_restrict_key)) ? 1 : 0;
+	mtc_vender_already_allowed = mtc_restrict_get_state() == 0;
 
 	if (!mtc_vender_already_allowed) {
 		if (mtc_restrict_want >= 0 && kapi_can_restrict_flip())

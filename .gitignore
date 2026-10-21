@@ -11,6 +11,8 @@
 # device binaries are CI-built (see build.yml) / locally via build.sh, never committed
 /package/kapi_check
 /package/balloon
+/tests/static_key
+/tests/static_key_no_jump
 
 # in-tree kernel module build output (`make module`, `make -C tier1`)
 *.o

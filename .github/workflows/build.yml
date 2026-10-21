@@ -22,6 +22,7 @@ jobs:
       # Tier-0b TSan race harness (§2 concurrency contract). gcc's TSan needs
       # ASLR reduced, hence setarch -R.
       - run: make -C tests harness && ./tests/harness
+      - run: make -C tests static_key static_key_no_jump && ./tests/static_key && ./tests/static_key_no_jump
       - run: make -C tests race && setarch "$(uname -m)" -R ./tests/race
 
   # GKI compile matrix — the real version-gate test. The kapi backend flattens

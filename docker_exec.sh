@@ -36,6 +36,13 @@ make -C "${KDIR}" -j "$(nproc)" M="${BUILD_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 mo
 for ENTRY in "$@"; do
 	MOD="${ENTRY##*:}"
 	if [ -f "${BUILD_DIR}/${MOD}.ko" ]; then
+		# Older vendor kernels with the same KMI lack this export. Catch a
+		# static_key_enabled() libcall in the actual .ko, not just the mocks.
+		if llvm-nm --undefined-only "${BUILD_DIR}/${MOD}.ko" | grep -qw static_key_count; then
+			echo "FAIL: ${MOD}@${TAG} requires unexported static_key_count"
+			FAIL=1
+			continue
+		fi
 		llvm-strip -d "${BUILD_DIR}/${MOD}.ko"
 		cp "${BUILD_DIR}/${MOD}.ko" "/out_${MOD}/${TAG}.ko"
 		echo "OK: ${MOD}@${TAG}"
